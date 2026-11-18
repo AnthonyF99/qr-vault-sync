@@ -1,387 +1,54 @@
-/* QR Vault Sync v0.1.0: bundled local-only Obsidian plugin. */
+/* QR Vault Sync v0.2.0 */
 'use strict';
 (function(){
 const modules=Object.create(null), cache=Object.create(null);
-modules["main"]=function(module,exports,require){
+modules["connectivity"]=function(module,exports,require){
 'use strict';
-const {Plugin, Modal, PluginSettingTab, Setting, Notice, Platform, TFile, TFolder, requestUrl}=require('obsidian');
-const {BACKUP_ROOT, DEFAULTS, eligible, planSync, safePath, clampPort, runId, backupPath}=require('./core');
-const {randomBytes,b64url,fromBase64,toBase64,hashBytes,importKey,seal,unseal}=require('./crypto');
-const {drawQR}=require('./qr');
 
-const NOW=()=>Date.now();
-const date=ms=>new Date(ms).toLocaleString();
-const errorText=e=>e&&e.message?e.message:String(e);
-
-function isFile(plugin,path){const f=plugin.app.vault.getAbstractFileByPath(path);return f instanceof TFile?f:null;}
-async function fileHash(plugin,path) {
-  const f=isFile(plugin,path);
-  if(!f)return null;
-  const data=await plugin.app.vault.readBinary(f);
-  return {hash:await hashBytes(data),mtime:f.stat.mtime,size:f.stat.size};
+function remoteEndpoint(value, defaultPort) {
+  const input = value.trim();
+  if (!input) return null;
+  const match = /^([a-z0-9.-]+)(?::(\d{1,5}))?$/i.exec(input);
+  if (!match) throw new Error('Enter a Tailscale IPv4 address or full MagicDNS hostname, optionally followed by a port.');
+  const host = match[1].toLowerCase();
+  const octets = host.split('.').map(Number);
+  const tailscaleIP = /^(\d{1,3}\.){3}\d{1,3}$/.test(host) &&
+    octets.every(octet => octet <= 255) && octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127;
+  const magicDNS = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){2,}ts\.net$/.test(host);
+  const port = match[2] ? Number(match[2]) : defaultPort;
+  if (!(tailscaleIP || magicDNS) || !Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error('Use a Tailscale 100.64.0.0/10 address or full .ts.net hostname and a valid server port.');
+  }
+  return {host, port};
 }
-async function inventory(plugin){
-  const files={},excluded=[];
-  const max=plugin.settings.maxFileMB*1024*1024;
-  for(const file of plugin.app.vault.getFiles()) {
-    if(!eligible(file.path,plugin.settings))continue;
-    if(file.stat.size>max){excluded.push(file.path);continue;}
+
+async function selectEndpoint(pair, remote, probe) {
+  const candidates = [];
+  if (pair.ip) candidates.push({host:pair.ip,port:pair.port,transport:'LAN'});
+  if (remote) candidates.push({...remote,transport:'Remote'});
+  const failures = [];
+  for (const endpoint of candidates) {
     try {
-      const before={mtime:file.stat.mtime,size:file.stat.size};
-      const content=await plugin.app.vault.readBinary(file);
-      if(file.stat.mtime!==before.mtime||file.stat.size!==before.size){excluded.push(file.path+' (changed during scan)');continue;}
-      files[file.path]={hash:await hashBytes(content),mtime:before.mtime,ctime:file.stat.ctime,size:before.size};
-    }catch(e){excluded.push(file.path+' ('+errorText(e)+')');}
-  }
-  return {files,excluded};
-}
-async function ensureParents(plugin,path) {
-  const bits=path.split('/');bits.pop();let current='';
-  for(const part of bits){current=current?current+'/'+part:part;
-    const existing=plugin.app.vault.getAbstractFileByPath(current);
-    if(existing instanceof TFile)throw new Error('A file blocks folder '+current);
-    if(!existing) {
-      try {await plugin.app.vault.createFolder(current);}catch(e){if(!(plugin.app.vault.getAbstractFileByPath(current) instanceof TFolder))throw e;}
+      return {...endpoint, proof:await probe(endpoint)};
+    } catch (error) {
+      failures.push(endpoint.transport + ' ? ' + error.message);
     }
   }
-}
-async function backupExisting(plugin,path,device,batch) {
-  const old=isFile(plugin,path);if(!old)return;
-  const dest=backupPath(path,device,batch);
-  if(plugin.app.vault.getAbstractFileByPath(dest))throw new Error('Backup destination already exists: '+dest);
-  const data=await plugin.app.vault.readBinary(old);
-  await ensureParents(plugin,dest);
-  await plugin.app.vault.createBinary(dest,data,{ctime:old.stat.ctime,mtime:old.stat.mtime});
-}
-async function writeToVault(plugin, path, bytes, source, expectedHash, backup,device,batch) {
-  if(!eligible(path,plugin.settings))throw new Error('Invalid or excluded path: '+path);
-  if(bytes.byteLength>plugin.settings.maxFileMB*1024*1024)throw new Error('File too large: '+path);
-  if(await hashBytes(bytes)!==source.hash)throw new Error('Integrity check failed: '+path);
-  if(!Number.isFinite(source.mtime)||source.mtime<=0||!Number.isFinite(source.ctime)||source.ctime<=0)throw new Error('Invalid file timestamps');
-  let current=isFile(plugin,path);
-  if(expectedHash===null){if(plugin.app.vault.getAbstractFileByPath(path))throw new Error('Created meanwhile: '+path);}
-  else {if(!current|| (await fileHash(plugin,path)).hash!==expectedHash) throw new Error('Changed meanwhile: '+path);}
-  if(backup&&current)await backupExisting(plugin,path,device,batch);
-  // Check again after potentially expensive backup, before writing.
-  current=isFile(plugin,path);
-  if(expectedHash===null){if(plugin.app.vault.getAbstractFileByPath(path))throw new Error('Created meanwhile: '+path);}
-  else {if(!current|| (await fileHash(plugin,path)).hash!==expectedHash) throw new Error('Changed while preparing backup: '+path);}
-  await ensureParents(plugin,path);
-  if(current)await plugin.app.vault.modifyBinary(current,bytes,{mtime:source.mtime,ctime:source.ctime});
-  else await plugin.app.vault.createBinary(path,bytes,{mtime:source.mtime,ctime:source.ctime});
+  throw new Error(failures.join(' | ') || 'Configure a LAN or Tailscale endpoint.');
 }
 
-function localIps(){
-  if(!Platform.isDesktopApp)return [];
-  const os=require('os');const all=[];
-  for(const adapters of Object.values(os.networkInterfaces()))for(const x of adapters||[]) {
-    if(x.family==='IPv4'&&!x.internal&&/^\d+\.\d+\.\d+\.\d+$/.test(x.address)&&!all.includes(x.address))all.push(x.address);
-  }
-  return all.sort((a,b)=>scoreIp(b)-scoreIp(a));
-}
-function scoreIp(x){return /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(x)?1:0;}
-function isLanAddress(ip) {
-  const a=ip.split('.').map(Number);
-  return a[0]===10 || a[0]===127 || (a[0]===172&&a[1]>=16&&a[1]<=31) || (a[0]===192&&a[1]===168) || (a[0]===169&&a[1]===254);
-}
-function encodeLink(ip,port,sid,secret){
-  return `obsidian://qr-vault-sync?ip=${encodeURIComponent(ip)}&port=${port}&sid=${sid}&key=${encodeURIComponent(secret)}`;
-}
-function decodeLink(value) {
-  let p;
-  if(typeof value==='string') {
-    const match=/^obsidian:\/\/qr-vault-sync\?(.*)$/i.exec(value.trim());
-    if(!match)throw new Error('Paste a QR Vault Sync pairing link');
-    p=Object.fromEntries(new URLSearchParams(match[1]));
-  }else p=value;
-  if(!p||!/^(\d{1,3}\.){3}\d{1,3}$/.test(p.ip||''))throw new Error('Invalid network address');
-  if(p.ip.split('.').some(x=>Number(x)>255)||!isLanAddress(p.ip))throw new Error('Only private local-network addresses are allowed');
-  if(!/^[a-f0-9]{24,64}$/i.test(p.sid||''))throw new Error('Invalid pairing session');
-  if(!/^[a-zA-Z0-9_-]{43}$/.test(p.key||''))throw new Error('Invalid pairing key');
-  const port=Number(p.port);
-  if(!Number.isInteger(port)||port<1024||port>65535)throw new Error('Invalid pairing port');
-  return {ip:p.ip,port,sid:p.sid,key:p.key};
-}
-
-class QRVaultSync extends Plugin {
-  async onload(){
-    this.settings=Object.assign({},DEFAULTS,await this.loadData());
-    this.settings.port=clampPort(this.settings.port);
-    this.httpServer=null;this.activePort=null;this.session=null;this.busy=false;
-    this.addRibbonIcon('refresh-cw','QR Vault Sync',()=>this.openPanel());
-    this.addCommand({id:'show-qr-or-sync',name:'Show pairing QR / Sync vaults',callback:()=>this.openPanel()});
-    this.addSettingTab(new QVSSettings(this.app,this));
-    this.registerObsidianProtocolHandler('qr-vault-sync',async params=>this.connectAndSync(params));
-  }
-  onunload(){this.stopServer();}
-  async store(){await this.saveData(this.settings);}
-  openPanel(){if(Platform.isDesktopApp)new QRPanel(this.app,this).open();else new PhonePanel(this.app,this).open();}
-  async startServer(){
-    if(!Platform.isDesktopApp)throw new Error('Hosting requires desktop Obsidian');
-    if(this.httpServer){this.newSession();return;}
-    const http=require('http');
-    const server=http.createServer((req,res)=>{this.handleHttp(req,res).catch(e=>{
-      console.error('[QR Vault Sync] HTTP error',e);
-      if(!res.headersSent){res.writeHead(500,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify({error:'Request failed'}));}
-      else res.end();
-    });});
-    try {
-      await new Promise((resolve,reject)=>{
-        const onError=e=>{server.removeListener('listening',onListen);reject(e);};
-        const onListen=()=>{server.removeListener('error',onError);resolve();};
-        server.once('error',onError);server.once('listening',onListen);
-        server.listen(this.settings.port,'0.0.0.0');
-      });
-    }catch(e){try{server.close();}catch{}throw new Error('Cannot start LAN server on port '+this.settings.port+': '+errorText(e));}
-    this.httpServer=server;this.activePort=this.settings.port;this.newSession();
-    new Notice('QR Vault Sync: LAN server running. Keep Obsidian open.');
-  }
-  newSession(){
-    this.session={sid:[...randomBytes(18)].map(b=>b.toString(16).padStart(2,'0')).join(''),rawKey:b64url(randomBytes(32)),expires:NOW()+15*60*1000,ivSeen:new Set(),writes:Promise.resolve()};
-  }
-  stopServer(){if(this.httpServer){try{this.httpServer.close();}catch{}this.httpServer=null;}this.activePort=null;this.session=null;}
-  async handleHttp(req,res){
-    const reply=(status,payload)=>{res.writeHead(status,{'content-type':'application/json','cache-control':'no-store','x-content-type-options':'nosniff'});res.end(JSON.stringify(payload));};
-    if(req.method!=='POST'||req.url!=='/rpc'){reply(404,{error:'Not found'});return;}
-    const len=Number(req.headers['content-length']||0);
-    if(len>32*1024*1024){reply(413,{error:'Request too large'});return;}
-    const chunks=[];let size=0;
-    try{for await(const chunk of req){size+=chunk.length;if(size>32*1024*1024)throw new Error('Request too large');chunks.push(chunk);}}
-    catch{reply(413,{error:'Request too large'});return;}
-    let packet;
-    try{packet=JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{reply(400,{error:'Malformed request'});return;}
-    const session=this.session;
-    if(!session||session.expires<NOW()||packet.sid!==session.sid){reply(401,{error:'Pairing expired. Scan a new QR code.'});return;}
-    if(typeof packet.iv!=='string'||!/^[-_a-zA-Z0-9]{16}$/.test(packet.iv)||session.ivSeen.has(packet.iv)){
-      reply(400,{error:'Invalid or repeated request'});return;
-    }
-    const key=await importKey(session.rawKey);
-    let message;
-    try{message=await unseal(packet,key);}catch{reply(401,{error:'Unable to decrypt request'});return;}
-    session.ivSeen.add(packet.iv);if(session.ivSeen.size>1024)session.ivSeen.delete(session.ivSeen.values().next().value);
-    let result;
-    try{
-      if(!message||typeof message!=='object')throw new Error('Invalid operation');
-      if(message.op==='manifest'){
-        result={ok:true,...await inventory(this),limit:this.settings.maxFileMB};
-      }else if(message.op==='read') {
-        if(!eligible(message.path,this.settings)||typeof message.hash!=='string')throw new Error('Invalid file request');
-        const f=isFile(this,message.path);if(!f)throw new Error('File missing: '+message.path);
-        if(f.stat.size>this.settings.maxFileMB*1024*1024)throw new Error('File too large');
-        const bytes=await this.app.vault.readBinary(f);
-        const hash=await hashBytes(bytes);if(hash!==message.hash)throw new Error('File changed during sync: '+message.path);
-        result={ok:true,data:toBase64(bytes)};
-      }else if(message.op==='write') {
-        // Serialize remote writes so two simultaneous sync requests cannot race each other.
-        const work=async()=>{
-          if(!safePath(message.path)||!eligible(message.path,this.settings)||!message.source||typeof message.data!=='string')throw new Error('Invalid write request');
-          if(message.data.length>24*1024*1024)throw new Error('File too large');
-          if(typeof message.batch!=='string'||!/^\d{4}-[\w-]+$/.test(message.batch))throw new Error('Invalid backup batch');
-          const bytes=fromBase64(message.data);
-          await writeToVault(this,message.path,bytes,message.source,message.expected===null?null:String(message.expected),!!message.backup,'desktop',message.batch);
-          return {ok:true};
-        };
-        const prior=session.writes;
-        const next=prior.then(work);
-        session.writes=next.catch(()=>{});
-        result=await next;
-      }else throw new Error('Unknown operation');
-    }catch(e){result={ok:false,error:errorText(e)};}
-    if(this.session!==session){reply(401,{error:'Pairing session ended'});return;}
-    const sealed=await seal(result,key);
-    reply(200,sealed);
-  }
-  async rpc(pair,message){
-    const key=await importKey(pair.key);
-    const payload=await seal(message,key);
-    let response;
-    try{
-      response=await requestUrl({url:`http://${pair.ip}:${pair.port}/rpc`,method:'POST',contentType:'application/json',body:JSON.stringify({sid:pair.sid,...payload}),headers:{'Cache-Control':'no-store'}});
-    }catch(e){throw new Error('Could not reach desktop. Check both devices are on the same Wi-Fi, desktop firewall, and PC is still showing a valid pairing code. '+errorText(e));}
-    if(response.status!==200)throw new Error('Desktop rejected request (HTTP '+response.status+'). Re-scan a fresh QR code.');
-    const result=await unseal(response.json,key);
-    if(!result.ok)throw new Error(result.error||'Sync request failed');
-    return result;
-  }
-  async connectAndSync(raw){
-    if(this.busy){new Notice('A sync is already in progress');return;}
-    this.busy=true;
-    try{
-      const pair=decodeLink(raw);
-      const status=new Notice('QR Vault Sync: comparing vaults…',0);
-      let remote,local;
-      try{
-        // Desktop's manifest and phone's files are both hashed before planning.
-        remote=await this.rpc(pair,{op:'manifest'});
-        local=await inventory(this);
-      }finally{status.hide();}
-      const plan=planSync(local.files,remote.files);
-      const choices=await new PlanPanel(this.app,plan,this.settings.conflictPolicy,local.excluded,remote.excluded,pair.ip).choose();
-      if(!choices)return;
-      const tasks=[...plan.additions];
-      for(const c of plan.conflicts){
-        let decision=choices.mode==='individual'?await new ConflictPanel(this.app,c).choose():{from:c.from,backup:choices.mode==='backup'};
-        if(!decision)continue;
-        if(!decision.from)continue; // Equal/near-equal timestamps require an explicit direction.
-        const to=decision.from==='phone'?'desktop':'phone';
-        tasks.push({path:c.path,from:decision.from,to,source:c[decision.from],expected:c[to].hash,backup:!!decision.backup});
-      }
-      const batch=runId();const failed=[];let done=0;
-      const progress=new Notice('QR Vault Sync: transferring 0 / '+tasks.length,0);
-      try{
-        for(const task of tasks){
-          try{
-            if(task.from==='desktop'){
-              const r=await this.rpc(pair,{op:'read',path:task.path,hash:task.source.hash});
-              const bytes=fromBase64(r.data);
-              await writeToVault(this,task.path,bytes,task.source,task.expected,task.backup,'phone',batch);
-            }else{
-              const current=isFile(this,task.path);
-              if(!current)throw new Error('File missing on phone');
-              const bytes=await this.app.vault.readBinary(current);
-              if((await hashBytes(bytes))!==task.source.hash)throw new Error('File changed on phone during sync');
-              await this.rpc(pair,{op:'write',path:task.path,source:task.source,expected:task.expected,backup:task.backup,batch,data:toBase64(bytes)});
-            }
-            done++;
-          }catch(e){failed.push(`${task.path}: ${errorText(e)}`);}
-          progress.setMessage(`QR Vault Sync: transferred ${done} / ${tasks.length}`);
-        }
-      }finally{progress.hide();}
-      new ResultPanel(this.app,{done,total:tasks.length,unchanged:plan.unchanged.length,failed,skipped:plan.conflicts.length - tasks.filter(t=>t.expected!==null).length,excluded:local.excluded.length+remote.excluded.length}).open();
-    }catch(e){console.error('[QR Vault Sync]',e);new Notice('QR Vault Sync: '+errorText(e),9000);}
-    finally{this.busy=false;}
+async function withDeadline(request, milliseconds) {
+  let timer;
+  try {
+    return await Promise.race([request, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Request timed out')), milliseconds);
+    })]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-class QRPanel extends Modal{
-  constructor(app,plugin){super(app);this.plugin=plugin;this.onIp=null;}
-  async onOpen(){
-    const c=this.contentEl;c.empty();c.addClass('qvs');c.createEl('h2',{text:'QR Vault Sync'});
-    c.createEl('p',{text:'Open this vault in Obsidian on your phone. Scan the code using your phone camera. Both devices must share a local network.'});
-    try{await this.plugin.startServer();}
-    catch(e){c.createEl('p',{cls:'qvs-error',text:errorText(e)});return;}
-    const ips=localIps();if(!ips.length){c.createEl('p',{cls:'qvs-error',text:'No LAN IPv4 address found. Connect the PC to Wi-Fi or Ethernet.'});return;}
-    const select=c.createEl('select',{cls:'qvs-ip'});
-    for(const ip of ips)select.createEl('option',{text:ip,value:ip,attr:{value:ip}});
-    select.value=ips.includes(this.plugin.settings.selectedIP)?this.plugin.settings.selectedIP:ips[0];
-    const imageArea=c.createDiv({cls:'qvs-qr-container'});
-    const link=c.createEl('textarea',{cls:'qvs-link',attr:{rows:'3',readOnly:'true'}});
-    const render=()=>{imageArea.empty();const s=this.plugin.session;const uri=encodeLink(select.value,this.plugin.activePort,s.sid,s.rawKey);
-      drawQR(imageArea,uri);link.value=uri;};
-    select.addEventListener('change',()=>{this.plugin.settings.selectedIP=select.value;this.plugin.store();render();});
-    render();
-    const buttons=c.createDiv({cls:'qvs-buttons'});
-    new Setting(buttons).addButton(b=>b.setButtonText('Copy pairing link').onClick(()=>{navigator.clipboard.writeText(link.value).then(()=>new Notice('Pairing link copied')).catch(()=>new Notice('Select and copy the link below'));}));
-    new Setting(buttons).addButton(b=>b.setButtonText('New QR code').onClick(()=>{this.plugin.newSession();render();new Notice('Old QR code revoked.');}));
-    new Setting(buttons).addButton(b=>b.setButtonText('Stop server').onClick(()=>{this.plugin.stopServer();this.close();new Notice('QR Vault Sync stopped.');}));
-    c.createEl('p',{cls:'qvs-muted',text:'Pairing expires 15 minutes after code generation. Closing this window keeps the desktop server running; disabling the plugin stops it.'});
-  }
-  onClose(){this.contentEl.empty();}
-}
-
-class PhonePanel extends Modal{
-  constructor(app,plugin){super(app);this.plugin=plugin;}
-  onOpen(){const c=this.contentEl;c.empty();c.addClass('qvs');c.createEl('h2',{text:'Sync using a QR code'});
-    c.createEl('p',{text:'On your PC: Obsidian → QR Vault Sync → Show pairing QR. Scan with your phone camera and tap Open in Obsidian.'});
-    c.createEl('p',{text:'If your QR scanner does not open Obsidian, paste the pairing link below.'});
-    const input=c.createEl('textarea',{attr:{rows:'4',placeholder:'obsidian://qr-vault-sync?...'},cls:'qvs-link'});
-    new Setting(c).addButton(b=>b.setButtonText('Connect & compare').setCta().onClick(async()=>{const link=input.value;this.close();await this.plugin.connectAndSync(link);}));
-  }
-  onClose(){this.contentEl.empty();}
-}
-
-class SelectionModal extends Modal{
-  constructor(app){super(app);this._resolve=null;this._answered=false;}
-  choose(){return new Promise(resolve=>{this._resolve=resolve;this.open();});}
-  finish(value){if(this._answered)return;this._answered=true;this._resolve?.(value);this.close();}
-  onClose(){if(!this._answered)this.finish(null);this.contentEl.empty();}
-}
-class PlanPanel extends SelectionModal{
-  constructor(app,plan,policy,excludedLocal,excludedRemote,host){super(app);this.plan=plan;this.policy=policy;this.excludedLocal=excludedLocal;this.excludedRemote=excludedRemote;this.host=host;}
-  onOpen(){const c=this.contentEl;c.addClass('qvs');c.createEl('h2',{text:'Review your sync'});
-    c.createEl('p',{cls:'qvs-muted',text:`Connected desktop: ${this.host} (local Wi-Fi)`});
-    const p=this.plan;
-    const table=c.createEl('div',{cls:'qvs-summary'});
-    const data=[['New files to copy',p.additions.length],['Different versions to resolve',p.conflicts.length],['Already identical',p.unchanged.length],['Same-time conflicts (need manual choice)',p.conflicts.filter(x=>x.ambiguous).length],['Files excluded / too large',this.excludedLocal.length+this.excludedRemote.length]];
-    for(const [label,val] of data){const r=table.createDiv({cls:'qvs-stat'});r.createSpan({text:label});r.createEl('strong',{text:String(val)});}
-    c.createEl('p',{cls:'qvs-muted',text:'The newest timestamp wins when versions differ. A hash detects actual differences. Close to equal timestamps are not resolved automatically. Deletions are never propagated.'});
-    if(p.conflicts.length){
-      c.createEl('h3',{text:'Files with differing versions'});
-      const list=c.createDiv({cls:'qvs-conflicts'});
-      for(const x of p.conflicts.slice(0,50)){const row=list.createDiv({cls:'qvs-conflict'});row.createEl('strong',{text:x.path});
-        row.createEl('small',{text:x.ambiguous?'Similar timestamps — choose manually':`${x.from==='phone'?'Phone':'Desktop'} is newer`});}
-      if(p.conflicts.length>50)list.createEl('p',{text:`…and ${p.conflicts.length-50} more`});
-      if(this.policy!=='ask')c.createEl('p',{cls:'qvs-muted',text:`Your default setting: ${this.policy==='backup'?'back up older':'replace older'}. Choose an action below.`});
-      new Setting(c).addButton(b=>b.setButtonText('Review one by one').setCta().onClick(()=>this.finish({mode:'individual'})));
-      new Setting(c).addButton(b=>b.setButtonText('Back up all older versions').onClick(()=>this.finish({mode:'backup'})));
-      new Setting(c).addButton(b=>b.setButtonText('Replace all older versions').setWarning().onClick(()=>new DangerPanel(this.app).choose().then(ok=>{if(ok)this.finish({mode:'replace'});}))); 
-    }else new Setting(c).addButton(b=>b.setButtonText('Sync now').setCta().onClick(()=>this.finish({mode:'backup'})));
-    new Setting(c).addButton(b=>b.setButtonText('Cancel').onClick(()=>this.finish(null)));
-  }
-}
-class DangerPanel extends SelectionModal{
-  onOpen(){const c=this.contentEl;c.addClass('qvs');c.createEl('h2',{text:'Replace without backups?'});
-    c.createEl('p',{text:'Older versions will be permanently overwritten. To retain copies of the old content, select “Back up all” instead. This cannot be undone by the plugin.'});
-    new Setting(c).addButton(b=>b.setButtonText('Yes, replace older versions').setWarning().onClick(()=>this.finish(true)));
-    new Setting(c).addButton(b=>b.setButtonText('Cancel').onClick(()=>this.finish(false)));
-  }
-}
-class ConflictPanel extends SelectionModal{
-  constructor(app,item){super(app);this.item=item;}
-  onOpen(){const c=this.contentEl;c.addClass('qvs');const x=this.item;
-    c.createEl('h2',{text:'Choose a version'});c.createEl('h3',{text:x.path});
-    c.createEl('p',{text:`Phone: ${date(x.phone.mtime)}  •  ${x.phone.size} bytes`});
-    c.createEl('p',{text:`Desktop: ${date(x.desktop.mtime)}  •  ${x.desktop.size} bytes`});
-    if(x.ambiguous){c.createEl('p',{cls:'qvs-error',text:'Timestamps are too close to choose reliably. Pick which device should win.'});
-      for(const from of ['phone','desktop']){
-        new Setting(c).addButton(b=>b.setButtonText(`Use ${from} (back up other version)`).onClick(()=>this.finish({from,backup:true})));
-        new Setting(c).addButton(b=>b.setButtonText(`Use ${from} (replace other version)`).setWarning().onClick(()=>this.finish({from,backup:false})));
-      }
-    }else {
-      c.createEl('p',{text:`Newest version is on ${x.from}.`});
-      new Setting(c).addButton(b=>b.setButtonText('Keep newest + back up older').setCta().onClick(()=>this.finish({from:x.from,backup:true})));
-      new Setting(c).addButton(b=>b.setButtonText('Keep newest + replace older').setWarning().onClick(()=>this.finish({from:x.from,backup:false})));
-    }
-    new Setting(c).addButton(b=>b.setButtonText('Skip this file').onClick(()=>this.finish(null)));
-  }
-}
-class ResultPanel extends Modal{
-  constructor(app,data){super(app);this.data=data;}
-  onOpen(){const c=this.contentEl;c.addClass('qvs');c.createEl('h2',{text:'Sync finished'});
-    const x=this.data;c.createEl('p',{text:`${x.done} / ${x.total} files transferred. ${x.unchanged} already identical. ${x.skipped} conflicting files skipped. ${x.excluded} excluded or too large.`});
-    if(x.failed.length){c.createEl('p',{cls:'qvs-error',text:`${x.failed.length} files failed (not overwritten):`});const box=c.createEl('pre',{cls:'qvs-errors'});box.setText(x.failed.join('\n'));}
-    else c.createEl('p',{text:'No transfer errors reported.'});
-    c.createEl('p',{text:`Older copies, when selected, are stored in “${BACKUP_ROOT}”.`});
-    new Setting(c).addButton(b=>b.setButtonText('Done').setCta().onClick(()=>this.close()));
-  }
-  onClose(){this.contentEl.empty();}
-}
-class QVSSettings extends PluginSettingTab{
-  constructor(app,plugin){super(app,plugin);this.plugin=plugin;}
-  display(){const c=this.containerEl;c.empty();c.createEl('h2',{text:'QR Vault Sync'});
-    c.createEl('p',{text:'Private, local-Wi-Fi sync. No cloud account. Install on both your PC and phone. PC hosts; phone scans and starts sync.'});
-    new Setting(c).setName('Open sync panel').setDesc('Desktop: show a QR code. Mobile: paste a pairing link if camera scanning fails.')
-      .addButton(b=>b.setButtonText('Open').onClick(()=>this.plugin.openPanel()));
-    new Setting(c).setName('Default conflict behavior').setDesc('A run always asks for final approval; choose per-file, replace all, or back up all.')
-      .addDropdown(d=>d.addOption('ask','Ask for each file').addOption('backup','Prefer backup all').addOption('replace','Prefer replace all').setValue(this.plugin.settings.conflictPolicy).onChange(async v=>{this.plugin.settings.conflictPolicy=v;await this.plugin.store();}));
-    new Setting(c).setName('Include attachments').setDesc('Sync images, PDFs, canvas files and other vault files, as well as Markdown.')
-      .addToggle(t=>t.setValue(this.plugin.settings.includeAttachments).onChange(async v=>{this.plugin.settings.includeAttachments=v;await this.plugin.store();}));
-    new Setting(c).setName('Maximum file size (MB)').setDesc('Larger files are skipped to limit mobile memory. Defaults to 8 MB.')
-      .addText(t=>t.setValue(String(this.plugin.settings.maxFileMB)).onChange(async v=>{const n=Number(v);if(Number.isFinite(n)&&n>=1&&n<=16){this.plugin.settings.maxFileMB=n;await this.plugin.store();}}));
-    new Setting(c).setName('Exclude folders').setDesc('One relative vault folder per line; QR Sync Backups and .obsidian are always excluded.')
-      .addTextArea(t=>t.setPlaceholder('Private\nArchive').setValue(this.plugin.settings.exclusions).onChange(async v=>{this.plugin.settings.exclusions=v;await this.plugin.store();}));
-    new Setting(c).setName('Backup folder').setDesc('Always “'+BACKUP_ROOT+'” at the root of each vault. Excluded from all transfers.');
-    if(Platform.isDesktopApp){
-      new Setting(c).setName('PC server port').setDesc('Change this only if necessary. Restart the server to apply changes.')
-        .addText(t=>t.setValue(String(this.plugin.settings.port)).onChange(async v=>{const n=Number(v);if(Number.isInteger(n)&&n>=1024&&n<=65535){this.plugin.settings.port=n;await this.plugin.store();}}));
-      new Setting(c).setName('Stop sharing').setDesc('Stop listening on your local network and invalidate the QR code.')
-        .addButton(b=>b.setButtonText('Stop server').onClick(()=>{this.plugin.stopServer();new Notice('LAN server stopped.');}));
-    }
-    c.createEl('p',{cls:'qvs-muted',text:'Security: QR pairing uses an expiring random AES-256-GCM key. Keep the QR code private. The server listens on your LAN until stopped or Obsidian closes. Firewalls may ask to allow Obsidian on private networks.'});
-  }
-}
-module.exports=QRVaultSync;
-module.exports.__testing={inventory,writeToVault,backupExisting,decodeLink,encodeLink,ensureParents,fileHash,QRVaultSync};
+module.exports = {remoteEndpoint, selectEndpoint, withDeadline};
 
 };
 modules["core"]=function(module,exports,require){
@@ -400,7 +67,7 @@ const DEFAULTS = Object.freeze({
 
 function safePath(path) {
   if (typeof path !== 'string' || !path || path.length > 1024 || path.includes('\\') || path.startsWith('/') || /[\u0000-\u001f]/.test(path)) return false;
-  if (path.split('/').some(part => !part || part === '.' || part === '..' || part.startsWith('.'))) return false;
+  if (path.split('/').some(part => !part || part === '.' || part === '..' || part.startsWith('.') || /[. ]$/.test(part) || /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(part))) return false;
   if (path.split('/').some(part => /[:*?"<>|]/.test(part))) return false;
   return true;
 }
@@ -408,27 +75,43 @@ function safePath(path) {
 function within(path, folder) { return path === folder || path.startsWith(folder + '/'); }
 
 function eligible(path, settings) {
-  if (!safePath(path) || within(path, BACKUP_ROOT) || within(path, '.obsidian')) return false;
+  if (!safePath(path) || within(path.toLowerCase(), BACKUP_ROOT.toLowerCase()) || within(path, '.obsidian')) return false;
   if (settings.includeAttachments === false && !path.toLowerCase().endsWith('.md')) return false;
   const exclusions = (settings.exclusions || '').split(/[\n,]/).map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
   if (exclusions.some(dir => within(path, dir))) return false;
   return true;
 }
 
-function planSync(phone, desktop) {
+function planSync(phone, desktop, baseline = {}, unavailable = []) {
+  const blocked = new Set(unavailable);
   const all = new Set([...Object.keys(phone), ...Object.keys(desktop)]);
   const additions = [], conflicts = [], unchanged = [];
-  for (const path of [...all].sort((a,b)=>a.localeCompare(b))) {
-    const a=phone[path], b=desktop[path];
+  for (const path of all) {
+    if (blocked.has(path)) continue;
+    const a=Object.hasOwn(phone,path)?phone[path]:null;
+    const b=Object.hasOwn(desktop,path)?desktop[path]:null;
     if (!a || !b) {
+      if (Object.hasOwn(baseline,path)) continue;
       additions.push({path, from:a?'phone':'desktop', to:a?'desktop':'phone', source:a||b, expected:null});
       continue;
     }
     if (a.hash===b.hash) {unchanged.push(path);continue;}
+    const common = Object.hasOwn(baseline,path) ? baseline[path] : null;
+    if (common && (common === a.hash || common === b.hash)) {
+      const from = common === a.hash ? 'desktop' : 'phone';
+      additions.push({path,from,to:from==='phone'?'desktop':'phone',source:from==='phone'?a:b,expected:common,backup:true});
+      continue;
+    }
+    const concurrent = !!common;
     const diff=a.mtime-b.mtime;
-    conflicts.push({path, phone:a, desktop:b, from:Math.abs(diff)<=MAX_CLOCK_SKEW_MS?null:diff>0?'phone':'desktop', ambiguous:Math.abs(diff)<=MAX_CLOCK_SKEW_MS});
+    conflicts.push({path, phone:a, desktop:b, concurrent, from:concurrent?null:Math.abs(diff)<=MAX_CLOCK_SKEW_MS?null:diff>0?'phone':'desktop', ambiguous:Math.abs(diff)<=MAX_CLOCK_SKEW_MS});
   }
   return { additions, conflicts, unchanged };
+}
+
+function bulkConflictDecision(conflict, mode) {
+  if ((mode !== 'replace' && mode !== 'backup') || !conflict.from || conflict.concurrent) return null;
+  return {from:conflict.from,backup:mode==='backup'};
 }
 
 function clampPort(n) {
@@ -439,13 +122,13 @@ function clampPort(n) {
 function runId() {return new Date().toISOString().replace(/[:.]/g,'-')+'-'+Math.random().toString(36).slice(2,8);}
 
 function backupPath(path, device, batch) {
-  if (!safePath(path) || !/^[a-z0-9-]+$/i.test(batch) || !/^(phone|desktop)$/.test(device)) throw new Error('Invalid backup path');
+  if (!safePath(path) || !/^[a-z0-9_-]+$/i.test(batch) || !/^(phone|desktop)$/.test(device)) throw new Error('Invalid backup path');
   return `${BACKUP_ROOT}/${batch}/${device}/${path}`;
 }
 
 function sameEntry(a,b) {return (!a&&!b)||!!(a&&b&&a.hash===b.hash&&a.mtime===b.mtime&&a.size===b.size);}
 
-module.exports={BACKUP_ROOT,DEFAULTS,MAX_CLOCK_SKEW_MS,safePath,eligible,planSync,clampPort,runId,backupPath,sameEntry};
+module.exports={BACKUP_ROOT,DEFAULTS,MAX_CLOCK_SKEW_MS,safePath,eligible,planSync,bulkConflictDecision,clampPort,runId,backupPath,sameEntry};
 
 };
 modules["crypto"]=function(module,exports,require){
@@ -483,6 +166,739 @@ async function unseal(packet,key) {
 module.exports={webCrypto,randomBytes,toBase64,fromBase64,b64url,fromB64url,hashBytes,importKey,seal,unseal};
 
 };
+modules["desktop"]=function(module,exports,require){
+'use strict';
+
+const http = require('http');
+const os = require('os');
+
+function localIps(){
+  const all=[];
+  for(const adapters of Object.values(os.networkInterfaces()))for(const x of adapters||[]) {
+    if(x.family==='IPv4'&&!x.internal&&/^\d+\.\d+\.\d+\.\d+$/.test(x.address)&&!all.includes(x.address))all.push(x.address);
+  }
+  return all.sort((a,b)=>scoreIp(b)-scoreIp(a));
+}
+function scoreIp(x){return /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(x)?1:0;}
+
+async function listen(port, handler) {
+  const server = http.createServer((request, response) => {
+    handler(request,response).catch(() => {
+      if (!response.headersSent) {
+        response.writeHead(500,{'content-type':'application/json','cache-control':'no-store'});
+        response.end(JSON.stringify({error:'Request failed'}));
+      } else response.end();
+    });
+  });
+  await new Promise((resolve,reject) => {
+    server.once('error',reject);
+    server.listen(port,'0.0.0.0',() => {
+      server.removeListener('error',reject);
+      resolve();
+    });
+  });
+  return server;
+}
+
+module.exports = {listen,localIps};
+
+};
+modules["file-index"]=function(module,exports,require){
+'use strict';
+
+const {eligible} = require('./core');
+const {hashBytes} = require('./crypto');
+
+const VERIFY_AGE = 7 * 24 * 60 * 60 * 1000;
+const yieldToUI = () => new Promise(resolve => setTimeout(resolve, 0));
+
+class FileIndex {
+  constructor(saved = {}) {
+    this.entries = Object.assign(Object.create(null), saved);
+    this.dirty = new Set();
+    this.revision = 0;
+    this.pending = Promise.resolve();
+  }
+
+  invalidate(path, recursive = false) {
+    this.revision++;
+    this.dirty.add(path);
+    delete this.entries[path];
+    if (recursive) {
+      for (const child of Object.keys(this.entries)) {
+        if (child.startsWith(path + '/')) this.invalidate(child);
+      }
+    }
+  }
+
+  scan(plugin, progress, signal) {
+    const next = this.pending.then(() => this.build(plugin, progress, signal));
+    this.pending = next.catch(() => {});
+    return next;
+  }
+
+  async build(plugin, progress, signal) {
+    const vault = plugin.app.vault;
+    const files = Object.create(null);
+    const excluded = [];
+    const unavailable = [];
+    const seen = new Set();
+    const candidates = vault.getFiles();
+    const now = Date.now();
+    let scanned = 0;
+    let lastYield = performance.now();
+    const max = plugin.settings.maxFileMB * 1024 * 1024;
+    for (let start = 0; start < candidates.length; start += 128) {
+      signal?.throwIfAborted();
+      const group = candidates.slice(start, start + 128);
+      for (let offset = 0; offset < group.length; offset += 3) {
+        await Promise.all(group.slice(offset, offset + 3).map(async file => {
+          const {path} = file;
+          seen.add(path);
+          if (!eligible(path, plugin.settings)) {
+            if (eligible(path, {})) unavailable.push(path);
+            return;
+          }
+          const {mtime, ctime, size} = file.stat;
+          try {
+            if (size > max) throw new Error('exceeds size limit');
+            let entry = this.entries[path];
+            if (!entry || entry.size !== size || entry.mtime !== mtime || entry.ctime !== ctime ||
+                !/^[\w-]{43}$/.test(entry.hash) || !(now >= entry.lastVerified && now - entry.lastVerified < VERIFY_AGE)) {
+              const revision = this.revision;
+              const bytes = await vault.readBinary(file);
+              const hash = await hashBytes(bytes);
+              if (file.path !== path || file.stat.mtime !== mtime || file.stat.ctime !== ctime ||
+                  file.stat.size !== size || bytes.byteLength !== size ||
+                  (revision !== this.revision)) {
+                throw new Error('changed during scan');
+              }
+              entry = {path, size, mtime, ctime, hash, lastVerified: now};
+              this.entries[path] = entry;
+              this.dirty.delete(path);
+            }
+            files[path] = {size, mtime, ctime, hash: entry.hash};
+          } catch (error) {
+            unavailable.push(path);
+            excluded.push(path + ' (' + error.message + ')');
+          }
+        }));
+      }
+      scanned += group.length;
+      progress?.(scanned, candidates.length);
+      if (performance.now() - lastYield >= 16) {
+        await yieldToUI();
+        lastYield = performance.now();
+      }
+    }
+    for (const path of Object.keys(this.entries)) {
+      if (!seen.has(path)) delete this.entries[path];
+    }
+    for (const path of this.dirty) {
+      if (Object.hasOwn(files, path)) {
+        delete files[path];
+        unavailable.push(path);
+      }
+      if (!seen.has(path)) this.dirty.delete(path);
+    }
+    return {files, excluded, unavailable, scanned};
+  }
+}
+
+module.exports = {FileIndex, VERIFY_AGE};
+
+};
+modules["main"]=function(module,exports,require){
+'use strict';
+const {Plugin, Modal, PluginSettingTab, Setting, Notice, Platform, TFile, TFolder, requestUrl}=require('obsidian');
+const {BACKUP_ROOT, DEFAULTS, eligible, planSync, bulkConflictDecision, safePath, clampPort, runId, backupPath}=require('./core');
+const {randomBytes,b64url,fromBase64,toBase64,hashBytes,importKey,seal,unseal}=require('./crypto');
+const {remoteEndpoint,selectEndpoint,withDeadline}=require('./connectivity');
+const {packManifest,unpackManifest}=require('./manifest-wire');
+const {FileIndex}=require('./file-index');
+const {drawQR}=require('./qr');
+
+const NOW=()=>Date.now();
+const date=ms=>new Date(ms).toLocaleString();
+const errorText=e=>e&&e.message?e.message:String(e);
+
+function isFile(plugin,path){const f=plugin.app.vault.getAbstractFileByPath(path);return f instanceof TFile?f:null;}
+async function fileHash(plugin,path) {
+  const f=isFile(plugin,path);
+  if(!f)return null;
+  const {mtime,size,ctime}=f.stat;
+  const revision=plugin.index?.revision;
+  const data=await plugin.app.vault.readBinary(f);
+  const hash=await hashBytes(data);
+  if(isFile(plugin,path)!==f || f.stat.mtime!==mtime || f.stat.size!==size ||
+     f.stat.ctime!==ctime || data.byteLength!==size || revision!==plugin.index?.revision){
+    throw new Error('Changed while checking ' + path + '. Compare again.');
+  }
+  return {hash,mtime,size};
+}
+async function inventory(plugin, progress, signal) {
+  plugin.index ??= new FileIndex();
+  const result = await plugin.index.scan(plugin, progress, signal);
+  plugin.scheduleStore?.();
+  return result;
+}
+async function ensureParents(plugin,path) {
+  const bits=path.split('/');bits.pop();let current='';
+  for(const part of bits){current=current?current+'/'+part:part;
+    const existing=plugin.app.vault.getAbstractFileByPath(current);
+    if(existing instanceof TFile)throw new Error('A file blocks folder '+current);
+    if(!existing) {
+      try {await plugin.app.vault.createFolder(current);}catch(e){if(!(plugin.app.vault.getAbstractFileByPath(current) instanceof TFolder))throw e;}
+    }
+  }
+}
+async function backupExisting(plugin,path,device,batch) {
+  const old=isFile(plugin,path);if(!old)return;
+  const dest=backupPath(path,device,batch);
+  if(plugin.app.vault.getAbstractFileByPath(dest))throw new Error('Backup destination already exists: '+dest);
+  const data=await plugin.app.vault.readBinary(old);
+  await ensureParents(plugin,dest);
+  await plugin.app.vault.createBinary(dest,data,{ctime:old.stat.ctime,mtime:old.stat.mtime});
+}
+async function writeToVault(plugin, path, bytes, source, expectedHash, backup,device,batch) {
+  if(!eligible(path,plugin.settings))throw new Error('Invalid or excluded path: '+path);
+  if(bytes.byteLength>plugin.settings.maxFileMB*1024*1024)throw new Error('File too large: '+path);
+  if(await hashBytes(bytes)!==source.hash)throw new Error('Integrity check failed: '+path);
+  if(!Number.isFinite(source.mtime)||source.mtime<0||!Number.isFinite(source.ctime)||source.ctime<0)throw new Error('Invalid file timestamps');
+  await ensureParents(plugin,path);
+  let current=isFile(plugin,path);
+  if(expectedHash===null){if(plugin.app.vault.getAbstractFileByPath(path))throw new Error('Created meanwhile: '+path);}
+  else {if(!current|| (await fileHash(plugin,path)).hash!==expectedHash) throw new Error('Changed meanwhile: '+path);}
+  if(backup&&current)await backupExisting(plugin,path,device,batch);
+  // Check again after potentially expensive backup, before writing.
+  current=isFile(plugin,path);
+  if(expectedHash===null){if(plugin.app.vault.getAbstractFileByPath(path))throw new Error('Created meanwhile: '+path);}
+  else {if(!current|| (await fileHash(plugin,path)).hash!==expectedHash) throw new Error('Changed while preparing backup: '+path);}
+  if(current)await plugin.app.vault.modifyBinary(current,bytes,{mtime:source.mtime,ctime:source.ctime});
+  else await plugin.app.vault.createBinary(path,bytes,{mtime:source.mtime,ctime:source.ctime});
+}
+
+function isLanAddress(ip) {
+  const a=ip.split('.').map(Number);
+  return a[0]===10 || a[0]===127 || (a[0]===172&&a[1]>=16&&a[1]<=31) || (a[0]===192&&a[1]===168) || (a[0]===169&&a[1]===254);
+}
+function encodeLink(ip,port,sid,secret){
+  return `obsidian://qr-vault-sync?ip=${encodeURIComponent(ip)}&port=${port}&sid=${sid}&key=${encodeURIComponent(secret)}`;
+}
+function decodeLink(value) {
+  let p;
+  if(typeof value==='string') {
+    const match=/^obsidian:\/\/qr-vault-sync\?(.*)$/i.exec(value.trim());
+    if(!match)throw new Error('Paste a QR Vault Sync pairing link');
+    p=Object.fromEntries(new URLSearchParams(match[1]));
+  }else p=value;
+  if(!p||!/^(\d{1,3}\.){3}\d{1,3}$/.test(p.ip||''))throw new Error('Invalid network address');
+  if(p.ip.split('.').some(x=>Number(x)>255)||!isLanAddress(p.ip))throw new Error('Only private local-network addresses are allowed');
+  if(!/^[a-f0-9]{24,64}$/i.test(p.sid||''))throw new Error('Invalid pairing session');
+  if(!/^[a-zA-Z0-9_-]{43}$/.test(p.key||''))throw new Error('Invalid pairing key');
+  const port=Number(p.port);
+  if(!Number.isInteger(port)||port<1024||port>65535)throw new Error('Invalid pairing port');
+  return {ip:p.ip,port,sid:p.sid,key:p.key};
+}
+
+class QRVaultSync extends Plugin {
+  async onload(){
+    const saved = await this.loadData() || {};
+    const {fileIndex, ...settings} = saved;
+    this.settings=Object.assign({},DEFAULTS,settings);
+    this.index = new FileIndex(fileIndex);
+    this.settings.trustedPeers ??= {};
+    this.runtimePeers = new Map();
+    this.hostEpoch = b64url(randomBytes(18));
+    this.writes = Promise.resolve();
+    this.storeQueue = Promise.resolve();
+    const invalidate = file => {
+      this.index.invalidate(file.path,file instanceof TFolder);
+      this.scheduleStore();
+    };
+    for (const event of ['create','modify','delete']) {
+      this.registerEvent(this.app.vault.on(event,invalidate));
+    }
+    this.registerEvent(this.app.vault.on('rename',(file,oldPath)=>{
+      this.index.invalidate(oldPath,file instanceof TFolder);
+      invalidate(file);
+    }));
+    this.settings.port=clampPort(this.settings.port);
+    this.httpServer=null;this.activePort=null;this.session=null;this.busy=false;
+    this.addRibbonIcon('refresh-cw','QR Vault Sync',()=>this.openPanel());
+    this.addCommand({id:'show-qr-or-sync',name:'Show pairing QR / Sync vaults',callback:()=>this.openPanel()});
+    this.addSettingTab(new QVSSettings(this.app,this));
+    this.registerObsidianProtocolHandler('qr-vault-sync',async params=>this.connectAndSync(params));
+  }
+  onunload(){this.syncController?.abort();this.stopServer();clearTimeout(this.storeTimer);void this.store().catch(()=>{});}
+  scheduleStore(){
+    clearTimeout(this.storeTimer);
+    this.storeTimer=setTimeout(()=>{void this.store().catch(()=>new Notice('QR Vault Sync: could not save index'));},750);
+  }
+  async store(){
+    const next=this.storeQueue.then(()=>this.saveData({...this.settings,fileIndex:this.index.entries}));
+    this.storeQueue=next.catch(()=>{});
+    return next;
+  }
+  openPanel(){if(Platform.isDesktopApp)new QRPanel(this.app,this).open();else new PhonePanel(this.app,this).open();}
+  async startServer(){
+    if(!Platform.isDesktopApp)throw new Error('Hosting requires desktop Obsidian');
+    if(this.httpServer){if(!this.session||this.session.expires<NOW())this.newSession();return;}
+    const {listen}=require('./desktop');
+    this.startingServer ??= listen(this.settings.port,(req,res)=>this.handleHttp(req,res));
+    let server;
+    try{server=await this.startingServer;}
+    catch(error){throw new Error('Cannot start sync server on port '+this.settings.port+': '+errorText(error));}
+    finally{this.startingServer=null;}
+    if(this.httpServer===server)return;
+    this.hostEpoch=b64url(randomBytes(18));this.runtimePeers.clear();
+    this.httpServer=server;this.activePort=this.settings.port;this.newSession();
+    new Notice('QR Vault Sync: server running. Keep desktop Obsidian open.');
+  }
+  newSession(){
+    this.session={sid:[...randomBytes(18)].map(b=>b.toString(16).padStart(2,'0')).join(''),rawKey:b64url(randomBytes(32)),expires:NOW()+15*60*1000,ivSeen:new Set()};
+  }
+  stopServer(){if(this.httpServer){try{this.httpServer.close();}catch{}this.httpServer=null;}this.activePort=null;this.session=null;}
+  async handleHttp(req,res){
+    const reply=(status,payload)=>{res.writeHead(status,{'content-type':'application/json','cache-control':'no-store','x-content-type-options':'nosniff'});res.end(JSON.stringify(payload));};
+    if(req.method!=='POST'||req.url!=='/rpc'){reply(404,{error:'Not found'});return;}
+    const len=Number(req.headers['content-length']||0);
+    if(len>32*1024*1024){reply(413,{error:'Request too large'});return;}
+    const chunks=[];let size=0;
+    try{for await(const chunk of req){size+=chunk.length;if(size>32*1024*1024)throw new Error('Request too large');chunks.push(chunk);}}
+    catch{reply(413,{error:'Request too large'});return;}
+    let packet;
+    try{packet=JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{reply(400,{error:'Malformed request'});return;}
+    const qr=this.session;
+    let session=packet && packet.sid===qr?.sid && qr?.expires>=NOW() ? qr : null;
+    if (!session && packet && typeof packet.sid==='string' && Object.hasOwn(this.settings.trustedPeers,packet.sid)) {
+      session=this.runtimePeers.get(packet.sid);
+      if(!session){
+        session={rawKey:this.settings.trustedPeers[packet.sid],ivSeen:new Set(),trusted:true};
+        this.runtimePeers.set(packet.sid,session);
+      }
+    }
+    if(!session){reply(401,{error:'Pairing unavailable'});return;}
+    if(typeof packet.iv!=='string'||!/^[-_a-zA-Z0-9]{16}$/.test(packet.iv)||session.ivSeen.has(packet.iv)){
+      reply(400,{error:'Invalid or repeated request'});return;
+    }
+    const hostEpoch=this.hostEpoch;
+    const key=await importKey(session.rawKey);
+    let message;
+    try{message=await unseal(packet,key);}catch{reply(401,{error:'Unable to decrypt request'});return;}
+    if(session.ivSeen.has(packet.iv)){reply(400,{error:'Repeated request'});return;}
+    if(hostEpoch!==this.hostEpoch || !this.httpServer || (!session.trusted && this.session!==session)){
+      reply(401,{error:'Connection ended'});return;
+    }
+    if(session.trusted && (message?.v!==2 || (message.op!=='probe' && message.epoch!==this.hostEpoch))){
+      reply(401,{error:'Connection expired'});return;
+    }
+    if(session.ivSeen.size>=100000){reply(429,{error:'Restart hosting to renew the connection'});return;}
+    session.ivSeen.add(packet.iv);
+    let result;
+    try{
+      if(!message||typeof message!=='object')throw new Error('Invalid operation');
+      if(message.op==='probe' && message.v===2){
+        result={ok:true,epoch:this.hostEpoch,device:'Desktop'};
+      }else if(message.op==='trust' && message.v===2 && !session.trusted){
+        if(this.session!==session || session.claimed)throw new Error('Generate a fresh pairing code');
+        session.claimed=true;
+        const sid=b64url(randomBytes(18));
+        const key=b64url(randomBytes(32));
+        this.settings.trustedPeers[sid]=key;
+        try{await this.store();}catch(error){delete this.settings.trustedPeers[sid];session.claimed=false;throw error;}
+        if(this.session===session)this.session=null;
+        result={ok:true,pair:{sid,key}};
+      }else if(message.op==='manifest'){
+        const current=await inventory(this);
+        result={ok:true,...(message.v===2?packManifest(current):current),limit:this.settings.maxFileMB};
+      }else if(message.op==='read') {
+        if(!eligible(message.path,this.settings)||typeof message.hash!=='string')throw new Error('Invalid file request');
+        const f=isFile(this,message.path);if(!f)throw new Error('File missing: '+message.path);
+        if(f.stat.size>this.settings.maxFileMB*1024*1024)throw new Error('File too large');
+        const bytes=await this.app.vault.readBinary(f);
+        const hash=await hashBytes(bytes);if(hash!==message.hash)throw new Error('File changed during sync: '+message.path);
+        result={ok:true,data:toBase64(bytes)};
+      }else if(message.op==='write') {
+        // Serialize remote writes so two simultaneous sync requests cannot race each other.
+        const work=async()=>{
+          if(!this.httpServer || hostEpoch!==this.hostEpoch || (!session.trusted && this.session!==session) ||
+             (session.trusted && !Object.hasOwn(this.settings.trustedPeers,packet.sid)))throw new Error('Connection ended');
+          if(!safePath(message.path)||!eligible(message.path,this.settings)||!message.source||typeof message.data!=='string')throw new Error('Invalid write request');
+          if(message.data.length>24*1024*1024)throw new Error('File too large');
+          if(typeof message.batch!=='string'||!/^\d{4}-[\w-]+$/.test(message.batch))throw new Error('Invalid backup batch');
+          const bytes=fromBase64(message.data);
+          await writeToVault(this,message.path,bytes,message.source,message.expected===null?null:String(message.expected),!!message.backup,'desktop',message.batch);
+          return {ok:true};
+        };
+        const prior=this.writes;
+        const next=prior.then(work);
+        this.writes=next.catch(()=>{});
+        result=await next;
+      }else throw new Error('Unknown operation');
+    }catch(e){result={ok:false,error:errorText(e)};}
+    const sealed=await seal(message?.v===2?{...result,request:packet.iv}:result,key);
+    reply(200,sealed);
+  }
+  async rpc(pair,message,endpoint=pair.endpoint || {host:pair.ip,port:pair.port}){
+    const key=await importKey(pair.key);
+    const payload=await seal({...message,v:2,epoch:pair.epoch},key);
+    let response;
+    try{
+      const request=requestUrl({url:`http://${endpoint.host}:${endpoint.port}/rpc`,method:'POST',throw:false,contentType:'application/json',body:JSON.stringify({sid:pair.sid,...payload}),headers:{'Cache-Control':'no-store'}});
+      response=await withDeadline(request,message.op==='probe'?3500:120000);
+    }catch(e){const error=new Error('Connection failed. Check desktop hosting and the firewall, then compare again.');
+      error.connectionLost=true;
+      throw error;
+    }
+    if(response.status!==200)throw new Error('Desktop rejected request (HTTP '+response.status+'). Check hosting and pairing, then compare again.');
+    const result=await unseal(response.json,key);
+    if(result.request!==payload.iv)throw new Error('Desktop identity could not be verified. Check the pairing and plugin version.');
+    if(!result.ok)throw new Error(result.error||'Sync request failed');
+    return message.op==='manifest'?unpackManifest(result):result;
+  }
+  async notePreview(pair,item){
+    const current=isFile(this,item.path);
+    if(!current)throw new Error('The phone file is missing. Compare again.');
+    const phone=await this.app.vault.readBinary(current);
+    if(await hashBytes(phone)!==item.phone.hash)throw new Error('The phone file changed. Compare again.');
+    const desktop=await this.rpc(pair,{op:'read',path:item.path,hash:item.desktop.hash});
+    const decoder=new TextDecoder();
+    return [decoder.decode(phone),decoder.decode(fromBase64(desktop.data))];
+  }
+  async connectAndSync(raw){
+    if(this.busy){new Notice('A sync is already in progress');return;}
+    this.busy=true;
+    const controller=new AbortController();
+    this.syncController=controller;
+    let progress;
+    try{
+      progress=new ProgressPanel(this.app,controller,this.settings.lastSuccessfulSync);
+      progress.open();
+      progress.update('Connecting to desktop');
+      let pair=raw ? decodeLink(raw) : this.settings.savedPair;
+      if(!pair)throw new Error('Scan a desktop pairing code first.');
+      let remoteAddress,remoteError;
+      try{remoteAddress=remoteEndpoint(this.settings.remoteEndpoint||'',pair.port);}
+      catch(error){remoteError=error;}
+      const probe=async candidate=>this.rpc(pair,{op:'probe'},candidate);
+      const endpoint=await selectEndpoint(pair,remoteAddress,probe).catch(error=>{throw new Error(remoteError?error.message+' | '+remoteError.message:error.message);});
+      controller.signal.throwIfAborted();
+      const {epoch,device}=endpoint.proof;
+      if(raw){
+        const enrolled=await this.rpc(pair,{op:'trust'},endpoint);
+        pair={...enrolled.pair,ip:pair.ip,port:pair.port};
+        this.settings.savedPair=pair;
+        await this.store();
+      }
+      pair={...pair,endpoint,epoch};
+      this.connection={transport:endpoint.transport,device};
+      const comparisonStart=performance.now();
+      progress.device=device;
+      progress.transport=endpoint.transport;
+      progress.update('Waiting for desktop manifest');
+      const remote=await this.rpc(pair,{op:'manifest'});
+      controller.signal.throwIfAborted();
+      const local=await inventory(this,(done,total)=>progress.update('Indexing phone',done,total),controller.signal);
+      const baselines=this.settings.baselines ??= {};
+      const baseline=baselines[pair.sid] ??= Object.create(null);
+      const plan=planSync(local.files,remote.files,baseline,[...(local.unavailable||[]),...(remote.unavailable||[])]);
+      for(const path of plan.unchanged) Object.defineProperty(baseline,path,{value:local.files[path].hash,writable:true,enumerable:true,configurable:true});
+      await this.store();
+      controller.signal.throwIfAborted();
+      const comparisonMs=performance.now()-comparisonStart;
+      progress.complete();
+      const choices=await new PlanPanel(this.app,plan,this.settings.conflictPolicy,local.excluded,remote.excluded,endpoint.transport+' / '+device).choose();
+      if(!choices)return;
+      const tasks=[...plan.additions];
+      for(const c of plan.conflicts){
+        controller.signal.throwIfAborted();
+        let decision=choices.mode==='individual'?await new ConflictPanel(this.app,c,()=>this.notePreview(pair,c)).choose():bulkConflictDecision(c,choices.mode);
+        if(!decision)continue;
+        if(!decision.from)continue; // Equal/near-equal timestamps require an explicit direction.
+        const to=decision.from==='phone'?'desktop':'phone';
+        tasks.push({path:c.path,from:decision.from,to,source:c[decision.from],expected:c[to].hash,backup:!!decision.backup});
+      }
+      const batch=runId()+'-'+b64url(randomBytes(12));const failed=[];let done=0,bytesTransferred=0,processed=0;
+      controller.signal.throwIfAborted();
+      const transferStart=performance.now();
+      progress=new ProgressPanel(this.app,controller,this.settings.lastSuccessfulSync);
+      progress.device=device;
+      progress.transport=endpoint.transport;
+      progress.open();
+      progress.update('Transferring',0,tasks.length);
+      try{
+        for(const task of tasks){
+          if(controller.signal.aborted)break;
+          try{
+            if(task.from==='desktop'){
+              const r=await this.rpc(pair,{op:'read',path:task.path,hash:task.source.hash});
+              controller.signal.throwIfAborted();
+              const bytes=fromBase64(r.data);
+              await writeToVault(this,task.path,bytes,task.source,task.expected,task.backup,'phone',batch);
+            }else{
+              const current=isFile(this,task.path);
+              if(!current)throw new Error('File missing on phone');
+              const bytes=await this.app.vault.readBinary(current);
+              if((await hashBytes(bytes))!==task.source.hash)throw new Error('File changed on phone during sync');
+              controller.signal.throwIfAborted();
+              await this.rpc(pair,{op:'write',path:task.path,source:task.source,expected:task.expected,backup:task.backup,batch,data:toBase64(bytes)});
+            }
+            Object.defineProperty(baseline,task.path,{value:task.source.hash,writable:true,enumerable:true,configurable:true});
+            this.scheduleStore();
+            done++;
+            bytesTransferred+=task.source.size;
+          }catch(e){
+            if(!controller.signal.aborted)failed.push(`${task.path}: ${errorText(e)}`);
+            if(e.connectionLost || controller.signal.aborted)break;
+          }
+          progress.update(`Transferred ${done} files · ${bytesTransferred.toLocaleString()} bytes`,++processed,tasks.length);
+        }
+      }finally{progress.complete();}
+      const skipped=plan.conflicts.length-(tasks.length-plan.additions.length);
+      if(!failed.length&&!controller.signal.aborted&&!skipped)this.settings.lastSuccessfulSync=NOW();
+      await this.store();
+      new ResultPanel(this.app,{cancelled:controller.signal.aborted,device,transport:endpoint.transport,comparisonMs,transferMs:performance.now()-transferStart,bytesTransferred,scanned:(local.scanned||0)+(remote.scanned||0),changed:plan.additions.length+plan.conflicts.length,conflicts:plan.conflicts.length,done,total:tasks.length,unchanged:plan.unchanged.length,failed,skipped:plan.conflicts.length - (tasks.length-plan.additions.length),excluded:local.excluded.length+remote.excluded.length}).open();
+    }catch(e){if(!controller.signal.aborted)new Notice('QR Vault Sync: '+errorText(e),9000);}
+    finally{progress?.complete();this.busy=false;this.syncController=null;}
+  }
+}
+
+class ProgressPanel extends Modal {
+  constructor(app,controller,lastSync){
+    super(app);
+    this.controller=controller;
+    this.lastSync=lastSync;
+  }
+  onOpen(){
+    const c=this.contentEl;
+    c.addClass('qvs');
+    c.createEl('h2',{text:'QR Vault Sync'});
+    if(this.device)c.createEl('p',{text:`Connected to ${this.device} · ${this.transport}`});
+    if(this.lastSync)c.createEl('p',{text:`Last successful sync · ${date(this.lastSync)}`});
+    this.message=c.createEl('p',{attr:{role:'status'}});
+    this.bar=c.createEl('progress',{cls:'qvs-progress',attr:{'aria-label':'Sync progress'}});
+    new Setting(c).addButton(b=>b.setButtonText('Cancel').onClick(()=>{
+      this.controller.abort();
+      this.update('Cancelling after the current request');
+      b.setDisabled(true);
+    }));
+  }
+  update(text,done,total){
+    this.message.setText(total?`${text} · ${done.toLocaleString()} / ${total.toLocaleString()}`:text);
+    if(total){this.bar.max=total;this.bar.value=done;}
+    else this.bar.removeAttribute('value');
+  }
+  complete(){
+    if(this.finished)return;
+    this.finished=true;
+    this.close();
+  }
+  onClose(){if(!this.finished)this.controller.abort();}
+}
+
+class QRPanel extends Modal{
+  constructor(app,plugin){super(app);this.plugin=plugin;this.onIp=null;}
+  async onOpen(){
+    const c=this.contentEl;c.empty();c.addClass('qvs');c.createEl('h2',{text:'QR Vault Sync'});
+    c.createEl('p',{text:'Open this vault in Obsidian on your phone. Scan the code using your phone camera. Keep desktop Obsidian and this sync server running. Use local Wi-Fi or a configured Tailscale endpoint.'});
+    try{await this.plugin.startServer();}
+    catch(e){c.createEl('p',{cls:'qvs-error',text:errorText(e)});return;}
+    const ips=require('./desktop').localIps().filter(isLanAddress);
+    if(!ips.length){ips.push('127.0.0.1');c.createEl('p',{text:'No LAN address detected. Configure Tailscale on the phone before pairing.'});}
+    const select=c.createEl('select',{cls:'qvs-ip'});
+    for(const ip of ips)select.createEl('option',{text:ip,value:ip,attr:{value:ip}});
+    select.value=ips.includes(this.plugin.settings.selectedIP)?this.plugin.settings.selectedIP:ips[0];
+    const imageArea=c.createDiv({cls:'qvs-qr-container'});
+    const link=c.createEl('textarea',{cls:'qvs-link',attr:{rows:'3',readOnly:'true'}});
+    const render=()=>{imageArea.empty();if(!this.plugin.session)this.plugin.newSession();const s=this.plugin.session;const uri=encodeLink(select.value,this.plugin.activePort,s.sid,s.rawKey);
+      drawQR(imageArea,uri);link.value=uri;};
+    select.addEventListener('change',()=>{this.plugin.settings.selectedIP=select.value;this.plugin.store();render();});
+    render();
+    const buttons=c.createDiv({cls:'qvs-buttons'});
+    new Setting(buttons).addButton(b=>b.setButtonText('Copy pairing link').onClick(()=>{navigator.clipboard.writeText(link.value).then(()=>new Notice('Pairing link copied')).catch(()=>new Notice('Select and copy the link below'));}));
+    new Setting(buttons).addButton(b=>b.setButtonText('New QR code').onClick(()=>{this.plugin.newSession();render();new Notice('Old QR code revoked.');}));
+    new Setting(buttons).addButton(b=>b.setButtonText('Stop server').onClick(()=>{this.plugin.stopServer();this.close();new Notice('QR Vault Sync stopped.');}));
+    c.createEl('p',{cls:'qvs-muted',text:'Pairing expires 15 minutes after code generation. Closing this window keeps the desktop server running; disabling the plugin stops it.'});
+  }
+  onClose(){this.contentEl.empty();}
+}
+
+class PhonePanel extends Modal{
+  constructor(app,plugin){super(app);this.plugin=plugin;}
+  onOpen(){const c=this.contentEl;c.empty();c.addClass('qvs');c.createEl('h2',{text:'Sync using a QR code'});
+    c.createEl('p',{text:'On your PC: Obsidian → QR Vault Sync → Show pairing QR. Scan with your phone camera and tap Open in Obsidian.'});
+    c.createEl('p',{text:'If your QR scanner does not open Obsidian, paste the pairing link below.'});
+    if(this.plugin.settings.lastSuccessfulSync)c.createEl('p',{text:'Last successful sync · '+date(this.plugin.settings.lastSuccessfulSync)});
+    if(this.plugin.settings.savedPair)new Setting(c).setName('Paired desktop')
+      .addButton(b=>b.setButtonText('Compare vaults').setCta().onClick(()=>{this.close();void this.plugin.connectAndSync();}));
+    const input=c.createEl('textarea',{attr:{rows:'4',placeholder:'obsidian://qr-vault-sync?...'},cls:'qvs-link'});
+    new Setting(c).addButton(b=>b.setButtonText('Connect & compare').setCta().onClick(async()=>{const link=input.value;this.close();await this.plugin.connectAndSync(link);}));
+  }
+  onClose(){this.contentEl.empty();}
+}
+
+class SelectionModal extends Modal{
+  constructor(app){super(app);this._resolve=null;this._answered=false;}
+  choose(){return new Promise(resolve=>{this._resolve=resolve;this.open();});}
+  finish(value){if(this._answered)return;this._answered=true;this._resolve?.(value);this.close();}
+  onClose(){if(!this._answered)this.finish(null);this.contentEl.empty();}
+}
+class PlanPanel extends SelectionModal{
+  constructor(app,plan,policy,excludedLocal,excludedRemote,host){super(app);this.plan=plan;this.policy=policy;this.excludedLocal=excludedLocal;this.excludedRemote=excludedRemote;this.host=host;}
+  onOpen(){const c=this.contentEl;c.addClass('qvs');c.createEl('h2',{text:'Review your sync'});
+    c.createEl('p',{cls:'qvs-muted',text:`Connected desktop: ${this.host}`});
+    const p=this.plan;
+    const table=c.createEl('div',{cls:'qvs-summary'});
+    const data=[['Files to copy or update',p.additions.length],['Different versions to resolve',p.conflicts.length],['Already identical',p.unchanged.length],['Same-time conflicts (need manual choice)',p.conflicts.filter(x=>x.ambiguous).length],['Files excluded / too large',this.excludedLocal.length+this.excludedRemote.length]];
+    for(const [label,val] of data){const r=table.createDiv({cls:'qvs-stat'});r.createSpan({text:label});r.createEl('strong',{text:String(val)});}
+    c.createEl('p',{cls:'qvs-muted',text:'Content hashes identify differing versions. Known concurrent edits and similar timestamps require an individual decision. This sync never deletes files.'});
+    if(p.conflicts.length){
+      c.createEl('h3',{text:'Files with differing versions'});
+      const list=c.createDiv({cls:'qvs-conflicts'});
+      for(const x of p.conflicts.slice(0,50)){const row=list.createDiv({cls:'qvs-conflict'});row.createEl('strong',{text:x.path});
+        row.createEl('small',{text:x.concurrent?'Both devices changed this file':x.ambiguous?'Similar timestamps — choose manually':`${x.from==='phone'?'Phone':'Desktop'} is newer`});}
+      if(p.conflicts.length>50)list.createEl('p',{text:`…and ${p.conflicts.length-50} more`});
+      if(this.policy!=='ask')c.createEl('p',{cls:'qvs-muted',text:`Your default setting: ${this.policy==='backup'?'back up older':'replace older'}. Choose an action below.`});
+      new Setting(c).addButton(b=>b.setButtonText('Skip conflicting files').onClick(()=>this.finish({mode:'skip'})));
+      new Setting(c).addButton(b=>b.setButtonText('Review one by one').setCta().onClick(()=>this.finish({mode:'individual'})));
+      new Setting(c).addButton(b=>b.setButtonText('Back up all older versions').onClick(()=>this.finish({mode:'backup'})));
+      new Setting(c).addButton(b=>b.setButtonText('Replace all older versions').setWarning().onClick(()=>new DangerPanel(this.app).choose().then(ok=>{if(ok)this.finish({mode:'replace'});})));
+    }else new Setting(c).addButton(b=>b.setButtonText('Sync now').setCta().onClick(()=>this.finish({mode:'backup'})));
+    new Setting(c).addButton(b=>b.setButtonText('Cancel').onClick(()=>this.finish(null)));
+  }
+}
+class DangerPanel extends SelectionModal{
+  onOpen(){const c=this.contentEl;c.addClass('qvs');c.createEl('h2',{text:'Replace without backups?'});
+    c.createEl('p',{text:'Older versions will be permanently overwritten. To retain copies of the old content, select “Back up all” instead. This cannot be undone by the plugin.'});
+    new Setting(c).addButton(b=>b.setButtonText('Yes, replace older versions').setWarning().onClick(()=>this.finish(true)));
+    new Setting(c).addButton(b=>b.setButtonText('Cancel').onClick(()=>this.finish(false)));
+  }
+}
+class ConflictPanel extends SelectionModal{
+  constructor(app,item,preview){super(app);this.item=item;this.preview=preview;}
+  onOpen(){const c=this.contentEl;c.addClass('qvs');const x=this.item;
+    c.createEl('h2',{text:'Choose a version'});c.createEl('h3',{text:x.path});
+    c.createEl('p',{text:`Phone: ${date(x.phone.mtime)}  •  ${x.phone.size} bytes`});
+    c.createEl('p',{text:`Desktop: ${date(x.desktop.mtime)}  •  ${x.desktop.size} bytes`});
+    if(x.path.toLowerCase().endsWith('.md') && Math.max(x.phone.size,x.desktop.size)<=32768){
+      new Setting(c).addButton(b=>b.setButtonText('Compare note text').onClick(async()=>{
+        b.setDisabled(true);
+        try{
+          const texts=await this.preview();
+          if(this._answered)return;
+          const versions=c.createDiv({cls:'qvs-note-versions'});
+          for(const [index,title] of ['Phone','Desktop'].entries()){
+            const section=versions.createDiv();
+            section.createEl('h4',{text:title});
+            section.createEl('pre',{text:texts[index]});
+          }
+        }catch(error){new Notice(errorText(error));b.setDisabled(false);}
+      }));
+    }
+    if(x.concurrent)c.createEl('p',{text:`Both versions changed. ${x.ambiguous?'Timestamps are similar.':(x.phone.mtime>x.desktop.mtime?'Phone':'Desktop')+' appears newer.'}`});
+    if(x.ambiguous||x.concurrent){c.createEl('p',{cls:'qvs-error',text:'Choose which version to keep on both devices.'});
+      for(const from of ['phone','desktop']){
+        new Setting(c).addButton(b=>b.setButtonText(`Use ${from} (back up other version)`).onClick(()=>this.finish({from,backup:true})));
+        new Setting(c).addButton(b=>b.setButtonText(`Use ${from} (replace other version)`).setWarning().onClick(()=>this.finish({from,backup:false})));
+      }
+    }else {
+      c.createEl('p',{text:`Newest version is on ${x.from}.`});
+      new Setting(c).addButton(b=>b.setButtonText('Keep newest + back up older').setCta().onClick(()=>this.finish({from:x.from,backup:true})));
+      new Setting(c).addButton(b=>b.setButtonText('Keep newest + replace older').setWarning().onClick(()=>this.finish({from:x.from,backup:false})));
+    }
+    new Setting(c).addButton(b=>b.setButtonText('Skip this file').onClick(()=>this.finish(null)));
+  }
+}
+class ResultPanel extends Modal{
+  constructor(app,data){super(app);this.data=data;}
+  onOpen(){const c=this.contentEl;c.addClass('qvs');c.createEl('h2',{text:'Sync finished'});
+    const x=this.data;
+    c.createEl('p',{text:`${x.device} · ${x.transport}`});
+    c.createEl('p',{text:`${x.scanned.toLocaleString()} files scanned · ${x.changed} changed · ${x.conflicts} conflicts`});
+    c.createEl('p',{text:`${x.bytesTransferred.toLocaleString()} file bytes transferred · compare ${(x.comparisonMs/1000).toFixed(2)} s · transfer ${(x.transferMs/1000).toFixed(2)} s`});
+    if(x.cancelled)c.createEl('p',{text:'Sync cancelled.'});
+    c.createEl('p',{text:`${x.done} / ${x.total} files transferred. ${x.unchanged} already identical. ${x.skipped} conflicting files skipped. ${x.excluded} excluded or too large.`});
+    if(x.failed.length){c.createEl('p',{cls:'qvs-error',text:`${x.failed.length} files could not be confirmed:`});const box=c.createEl('pre',{cls:'qvs-errors'});box.setText(x.failed.join('\n'));}
+    else c.createEl('p',{text:'No transfer errors reported.'});
+    c.createEl('p',{text:`Older copies, when selected, are stored in “${BACKUP_ROOT}”.`});
+    new Setting(c).addButton(b=>b.setButtonText('Done').setCta().onClick(()=>this.close()));
+  }
+  onClose(){this.contentEl.empty();}
+}
+class QVSSettings extends PluginSettingTab{
+  constructor(app,plugin){super(app,plugin);this.plugin=plugin;}
+  display(){const c=this.containerEl;c.empty();c.createEl('h2',{text:'QR Vault Sync'});
+    c.createEl('p',{text:'Encrypted sync over local Wi-Fi or Tailscale. Keep the Windows sync server running and start sync from your phone.'});
+    new Setting(c).setName('Open sync panel').setDesc('Desktop: show a QR code. Mobile: paste a pairing link if camera scanning fails.')
+      .addButton(b=>b.setButtonText('Open').onClick(()=>this.plugin.openPanel()));
+    new Setting(c).setName('Default conflict behavior').setDesc('A run always asks for final approval; choose per-file, replace all, or back up all.')
+      .addDropdown(d=>d.addOption('ask','Ask for each file').addOption('backup','Prefer backup all').addOption('replace','Prefer replace all').setValue(this.plugin.settings.conflictPolicy).onChange(async v=>{this.plugin.settings.conflictPolicy=v;await this.plugin.store();}));
+    new Setting(c).setName('Include attachments').setDesc('Sync images, PDFs, canvas files and other vault files, as well as Markdown.')
+      .addToggle(t=>t.setValue(this.plugin.settings.includeAttachments).onChange(async v=>{this.plugin.settings.includeAttachments=v;await this.plugin.store();}));
+    new Setting(c).setName('Maximum file size (MB)').setDesc('Larger files are skipped to limit mobile memory. Defaults to 8 MB.')
+      .addText(t=>t.setValue(String(this.plugin.settings.maxFileMB)).onChange(async v=>{const n=Number(v);if(Number.isFinite(n)&&n>=1&&n<=16){this.plugin.settings.maxFileMB=n;await this.plugin.store();}}));
+    new Setting(c).setName('Exclude folders').setDesc('One relative vault folder per line; QR Sync Backups and .obsidian are always excluded.')
+      .addTextArea(t=>t.setPlaceholder('Private\nArchive').setValue(this.plugin.settings.exclusions).onChange(async v=>{this.plugin.settings.exclusions=v;await this.plugin.store();}));
+    new Setting(c).setName('Reverify file contents').setDesc('Discard cached hashes and reread eligible files at the next comparison.')
+      .addButton(b=>b.setButtonText('Clear hash cache').onClick(async()=>{
+        for(const path of Object.keys(this.plugin.index.entries))this.plugin.index.invalidate(path);
+        await this.plugin.store();
+        new Notice('Hash cache cleared.');
+      }));
+    new Setting(c).setName('Backup folder').setDesc('Always “'+BACKUP_ROOT+'” at the root of each vault. Excluded from all transfers.');
+    if(!Platform.isDesktopApp){
+      new Setting(c).setName('Remote endpoint').setDesc('Tailscale IPv4 or full MagicDNS hostname, optionally followed by :port. Keep desktop Obsidian and hosting running.')
+        .addText(t=>t.setPlaceholder('desktop.example.ts.net').setValue(this.plugin.settings.remoteEndpoint||'').onChange(async value=>{
+          this.plugin.settings.remoteEndpoint=value.trim();
+          await this.plugin.store();
+        }));
+    }
+    if(Platform.isDesktopApp){
+      new Setting(c).setName('Trusted phones').setDesc('Revoke saved credentials. Pair phones again to reconnect.')
+        .addButton(b=>b.setButtonText('Revoke trusted phones').onClick(async()=>{
+          this.plugin.settings.trustedPeers={};
+          this.plugin.runtimePeers.clear();
+          await this.plugin.store();
+          new Notice('Trusted phone credentials revoked.');
+        }));
+      new Setting(c).setName('PC server port').setDesc('Change this only if necessary. Restart the server to apply changes.')
+        .addText(t=>t.setValue(String(this.plugin.settings.port)).onChange(async v=>{const n=Number(v);if(Number.isInteger(n)&&n>=1024&&n<=65535){this.plugin.settings.port=n;await this.plugin.store();}}));
+      new Setting(c).setName('Stop sharing').setDesc('Stop listening on your local network and invalidate the QR code.')
+        .addButton(b=>b.setButtonText('Stop server').onClick(()=>{this.plugin.stopServer();new Notice('LAN server stopped.');}));
+    }
+    c.createEl('p',{cls:'qvs-muted',text:'Security: QR pairing uses an expiring random AES-256-GCM key. Keep the QR code private. The server listens on IPv4 until stopped or Obsidian closes. Scope Windows Firewall access to your LAN and trusted tailnet devices.'});
+  }
+}
+module.exports=QRVaultSync;
+module.exports.__testing={inventory,writeToVault,backupExisting,decodeLink,encodeLink,ensureParents,fileHash,QRVaultSync};
+
+};
+modules["manifest-wire"]=function(module,exports,require){
+'use strict';
+
+function packManifest(inventory) {
+  const {files,...metadata} = inventory;
+  const rows = [];
+  for (const path of Object.keys(files)) {
+    const {hash,mtime,ctime,size} = files[path];
+    rows.push([path,hash,mtime,ctime,size]);
+  }
+  return {...metadata,rows};
+}
+
+function unpackManifest({rows,...metadata}) {
+  if (!Array.isArray(rows)) throw new Error('Unsupported desktop manifest');
+  const files = Object.create(null);
+  for (const [path,hash,mtime,ctime,size] of rows) {
+    files[path] = {hash,mtime,ctime,size};
+  }
+  return {...metadata,files};
+}
+
+module.exports = {packManifest,unpackManifest};
+
+};
 modules["qr"]=function(module,exports,require){
 'use strict';
 // Kazuhiko Arase QRCode encoder (MIT), vendored under src/vendor/QRCode.
@@ -502,471 +918,6 @@ function drawQR(el, value) {
 module.exports={drawQR};
 
 };
-modules["vendor/QRCode/index"]=function(module,exports,require){
-//---------------------------------------------------------------------
-// QRCode for JavaScript
-//
-// Copyright (c) 2009 Kazuhiko Arase
-//
-// URL: http://www.d-project.com/
-//
-// Licensed under the MIT license:
-//   http://www.opensource.org/licenses/mit-license.php
-//
-// The word "QR Code" is registered trademark of 
-// DENSO WAVE INCORPORATED
-//   http://www.denso-wave.com/qrcode/faqpatent-e.html
-//
-//---------------------------------------------------------------------
-// Modified to work in node for this project (and some refactoring)
-//---------------------------------------------------------------------
-
-var QR8bitByte = require('./QR8bitByte');
-var QRUtil = require('./QRUtil');
-var QRPolynomial = require('./QRPolynomial');
-var QRRSBlock = require('./QRRSBlock');
-var QRBitBuffer = require('./QRBitBuffer');
-
-function QRCode(typeNumber, errorCorrectLevel) {
-	this.typeNumber = typeNumber;
-	this.errorCorrectLevel = errorCorrectLevel;
-	this.modules = null;
-	this.moduleCount = 0;
-	this.dataCache = null;
-	this.dataList = [];
-}
-
-QRCode.prototype = {
-	
-	addData : function(data) {
-		var newData = new QR8bitByte(data);
-		this.dataList.push(newData);
-		this.dataCache = null;
-	},
-	
-	isDark : function(row, col) {
-		if (row < 0 || this.moduleCount <= row || col < 0 || this.moduleCount <= col) {
-			throw new Error(row + "," + col);
-		}
-		return this.modules[row][col];
-	},
-
-	getModuleCount : function() {
-		return this.moduleCount;
-	},
-	
-	make : function() {
-		// Calculate automatically typeNumber if provided is < 1
-		if (this.typeNumber < 1 ){
-			var typeNumber = 1;
-			for (typeNumber = 1; typeNumber < 40; typeNumber++) {
-				var rsBlocks = QRRSBlock.getRSBlocks(typeNumber, this.errorCorrectLevel);
-
-				var buffer = new QRBitBuffer();
-				var totalDataCount = 0;
-				for (var i = 0; i < rsBlocks.length; i++) {
-					totalDataCount += rsBlocks[i].dataCount;
-				}
-
-				for (var x = 0; x < this.dataList.length; x++) {
-					var data = this.dataList[x];
-					buffer.put(data.mode, 4);
-					buffer.put(data.getLength(), QRUtil.getLengthInBits(data.mode, typeNumber) );
-					data.write(buffer);
-				}
-				if (buffer.getLengthInBits() <= totalDataCount * 8)
-					break;
-			}
-			this.typeNumber = typeNumber;
-		}
-		this.makeImpl(false, this.getBestMaskPattern() );
-	},
-	
-	makeImpl : function(test, maskPattern) {
-		
-		this.moduleCount = this.typeNumber * 4 + 17;
-		this.modules = new Array(this.moduleCount);
-		
-		for (var row = 0; row < this.moduleCount; row++) {
-			
-			this.modules[row] = new Array(this.moduleCount);
-			
-			for (var col = 0; col < this.moduleCount; col++) {
-				this.modules[row][col] = null;//(col + row) % 3;
-			}
-		}
-	
-		this.setupPositionProbePattern(0, 0);
-		this.setupPositionProbePattern(this.moduleCount - 7, 0);
-		this.setupPositionProbePattern(0, this.moduleCount - 7);
-		this.setupPositionAdjustPattern();
-		this.setupTimingPattern();
-		this.setupTypeInfo(test, maskPattern);
-		
-		if (this.typeNumber >= 7) {
-			this.setupTypeNumber(test);
-		}
-	
-		if (this.dataCache === null) {
-			this.dataCache = QRCode.createData(this.typeNumber, this.errorCorrectLevel, this.dataList);
-		}
-	
-		this.mapData(this.dataCache, maskPattern);
-	},
-
-	setupPositionProbePattern : function(row, col)  {
-		
-		for (var r = -1; r <= 7; r++) {
-			
-			if (row + r <= -1 || this.moduleCount <= row + r) continue;
-			
-			for (var c = -1; c <= 7; c++) {
-				
-				if (col + c <= -1 || this.moduleCount <= col + c) continue;
-				
-				if ( (0 <= r && r <= 6 && (c === 0 || c === 6) ) || 
-                     (0 <= c && c <= 6 && (r === 0 || r === 6) ) || 
-                     (2 <= r && r <= 4 && 2 <= c && c <= 4) ) {
-					this.modules[row + r][col + c] = true;
-				} else {
-					this.modules[row + r][col + c] = false;
-				}
-			}		
-		}		
-	},
-	
-	getBestMaskPattern : function() {
-	
-		var minLostPoint = 0;
-		var pattern = 0;
-	
-		for (var i = 0; i < 8; i++) {
-			
-			this.makeImpl(true, i);
-	
-			var lostPoint = QRUtil.getLostPoint(this);
-	
-			if (i === 0 || minLostPoint >  lostPoint) {
-				minLostPoint = lostPoint;
-				pattern = i;
-			}
-		}
-	
-		return pattern;
-	},
-	
-	createMovieClip : function(target_mc, instance_name, depth) {
-	
-		var qr_mc = target_mc.createEmptyMovieClip(instance_name, depth);
-		var cs = 1;
-	
-		this.make();
-
-		for (var row = 0; row < this.modules.length; row++) {
-			
-			var y = row * cs;
-			
-			for (var col = 0; col < this.modules[row].length; col++) {
-	
-				var x = col * cs;
-				var dark = this.modules[row][col];
-			
-				if (dark) {
-					qr_mc.beginFill(0, 100);
-					qr_mc.moveTo(x, y);
-					qr_mc.lineTo(x + cs, y);
-					qr_mc.lineTo(x + cs, y + cs);
-					qr_mc.lineTo(x, y + cs);
-					qr_mc.endFill();
-				}
-			}
-		}
-		
-		return qr_mc;
-	},
-
-	setupTimingPattern : function() {
-		
-		for (var r = 8; r < this.moduleCount - 8; r++) {
-			if (this.modules[r][6] !== null) {
-				continue;
-			}
-			this.modules[r][6] = (r % 2 === 0);
-		}
-	
-		for (var c = 8; c < this.moduleCount - 8; c++) {
-			if (this.modules[6][c] !== null) {
-				continue;
-			}
-			this.modules[6][c] = (c % 2 === 0);
-		}
-	},
-	
-	setupPositionAdjustPattern : function() {
-	
-		var pos = QRUtil.getPatternPosition(this.typeNumber);
-		
-		for (var i = 0; i < pos.length; i++) {
-		
-			for (var j = 0; j < pos.length; j++) {
-			
-				var row = pos[i];
-				var col = pos[j];
-				
-				if (this.modules[row][col] !== null) {
-					continue;
-				}
-				
-				for (var r = -2; r <= 2; r++) {
-				
-					for (var c = -2; c <= 2; c++) {
-					
-						if (Math.abs(r) === 2 || 
-                            Math.abs(c) === 2 ||
-                            (r === 0 && c === 0) ) {
-							this.modules[row + r][col + c] = true;
-						} else {
-							this.modules[row + r][col + c] = false;
-						}
-					}
-				}
-			}
-		}
-	},
-	
-	setupTypeNumber : function(test) {
-	
-		var bits = QRUtil.getBCHTypeNumber(this.typeNumber);
-        var mod;
-	
-		for (var i = 0; i < 18; i++) {
-			mod = (!test && ( (bits >> i) & 1) === 1);
-			this.modules[Math.floor(i / 3)][i % 3 + this.moduleCount - 8 - 3] = mod;
-		}
-	
-		for (var x = 0; x < 18; x++) {
-			mod = (!test && ( (bits >> x) & 1) === 1);
-			this.modules[x % 3 + this.moduleCount - 8 - 3][Math.floor(x / 3)] = mod;
-		}
-	},
-	
-	setupTypeInfo : function(test, maskPattern) {
-	
-		var data = (this.errorCorrectLevel << 3) | maskPattern;
-		var bits = QRUtil.getBCHTypeInfo(data);
-        var mod;
-	
-		// vertical		
-		for (var v = 0; v < 15; v++) {
-	
-			mod = (!test && ( (bits >> v) & 1) === 1);
-	
-			if (v < 6) {
-				this.modules[v][8] = mod;
-			} else if (v < 8) {
-				this.modules[v + 1][8] = mod;
-			} else {
-				this.modules[this.moduleCount - 15 + v][8] = mod;
-			}
-		}
-	
-		// horizontal
-		for (var h = 0; h < 15; h++) {
-	
-			mod = (!test && ( (bits >> h) & 1) === 1);
-			
-			if (h < 8) {
-				this.modules[8][this.moduleCount - h - 1] = mod;
-			} else if (h < 9) {
-				this.modules[8][15 - h - 1 + 1] = mod;
-			} else {
-				this.modules[8][15 - h - 1] = mod;
-			}
-		}
-	
-		// fixed module
-		this.modules[this.moduleCount - 8][8] = (!test);
-	
-	},
-	
-	mapData : function(data, maskPattern) {
-		
-		var inc = -1;
-		var row = this.moduleCount - 1;
-		var bitIndex = 7;
-		var byteIndex = 0;
-		
-		for (var col = this.moduleCount - 1; col > 0; col -= 2) {
-	
-			if (col === 6) col--;
-	
-			while (true) {
-	
-				for (var c = 0; c < 2; c++) {
-					
-					if (this.modules[row][col - c] === null) {
-						
-						var dark = false;
-	
-						if (byteIndex < data.length) {
-							dark = ( ( (data[byteIndex] >>> bitIndex) & 1) === 1);
-						}
-	
-						var mask = QRUtil.getMask(maskPattern, row, col - c);
-	
-						if (mask) {
-							dark = !dark;
-						}
-						
-						this.modules[row][col - c] = dark;
-						bitIndex--;
-	
-						if (bitIndex === -1) {
-							byteIndex++;
-							bitIndex = 7;
-						}
-					}
-				}
-								
-				row += inc;
-	
-				if (row < 0 || this.moduleCount <= row) {
-					row -= inc;
-					inc = -inc;
-					break;
-				}
-			}
-		}
-		
-	}
-
-};
-
-QRCode.PAD0 = 0xEC;
-QRCode.PAD1 = 0x11;
-
-QRCode.createData = function(typeNumber, errorCorrectLevel, dataList) {
-	
-	var rsBlocks = QRRSBlock.getRSBlocks(typeNumber, errorCorrectLevel);
-	
-	var buffer = new QRBitBuffer();
-	
-	for (var i = 0; i < dataList.length; i++) {
-		var data = dataList[i];
-		buffer.put(data.mode, 4);
-		buffer.put(data.getLength(), QRUtil.getLengthInBits(data.mode, typeNumber) );
-		data.write(buffer);
-	}
-
-	// calc num max data.
-	var totalDataCount = 0;
-	for (var x = 0; x < rsBlocks.length; x++) {
-		totalDataCount += rsBlocks[x].dataCount;
-	}
-
-	if (buffer.getLengthInBits() > totalDataCount * 8) {
-		throw new Error("code length overflow. (" + 
-            buffer.getLengthInBits() + 
-            ">" +  
-            totalDataCount * 8 + 
-            ")");
-	}
-
-	// end code
-	if (buffer.getLengthInBits() + 4 <= totalDataCount * 8) {
-		buffer.put(0, 4);
-	}
-
-	// padding
-	while (buffer.getLengthInBits() % 8 !== 0) {
-		buffer.putBit(false);
-	}
-
-	// padding
-	while (true) {
-		
-		if (buffer.getLengthInBits() >= totalDataCount * 8) {
-			break;
-		}
-		buffer.put(QRCode.PAD0, 8);
-		
-		if (buffer.getLengthInBits() >= totalDataCount * 8) {
-			break;
-		}
-		buffer.put(QRCode.PAD1, 8);
-	}
-
-	return QRCode.createBytes(buffer, rsBlocks);
-};
-
-QRCode.createBytes = function(buffer, rsBlocks) {
-
-	var offset = 0;
-	
-	var maxDcCount = 0;
-	var maxEcCount = 0;
-	
-	var dcdata = new Array(rsBlocks.length);
-	var ecdata = new Array(rsBlocks.length);
-	
-	for (var r = 0; r < rsBlocks.length; r++) {
-
-		var dcCount = rsBlocks[r].dataCount;
-		var ecCount = rsBlocks[r].totalCount - dcCount;
-
-		maxDcCount = Math.max(maxDcCount, dcCount);
-		maxEcCount = Math.max(maxEcCount, ecCount);
-		
-		dcdata[r] = new Array(dcCount);
-		
-		for (var i = 0; i < dcdata[r].length; i++) {
-			dcdata[r][i] = 0xff & buffer.buffer[i + offset];
-		}
-		offset += dcCount;
-		
-		var rsPoly = QRUtil.getErrorCorrectPolynomial(ecCount);
-		var rawPoly = new QRPolynomial(dcdata[r], rsPoly.getLength() - 1);
-
-		var modPoly = rawPoly.mod(rsPoly);
-		ecdata[r] = new Array(rsPoly.getLength() - 1);
-		for (var x = 0; x < ecdata[r].length; x++) {
-            var modIndex = x + modPoly.getLength() - ecdata[r].length;
-			ecdata[r][x] = (modIndex >= 0)? modPoly.get(modIndex) : 0;
-		}
-
-	}
-	
-	var totalCodeCount = 0;
-	for (var y = 0; y < rsBlocks.length; y++) {
-		totalCodeCount += rsBlocks[y].totalCount;
-	}
-
-	var data = new Array(totalCodeCount);
-	var index = 0;
-
-	for (var z = 0; z < maxDcCount; z++) {
-		for (var s = 0; s < rsBlocks.length; s++) {
-			if (z < dcdata[s].length) {
-				data[index++] = dcdata[s][z];
-			}
-		}
-	}
-
-	for (var xx = 0; xx < maxEcCount; xx++) {
-		for (var t = 0; t < rsBlocks.length; t++) {
-			if (xx < ecdata[t].length) {
-				data[index++] = ecdata[t][xx];
-			}
-		}
-	}
-
-	return data;
-
-};
-
-module.exports = QRCode;
-
-};
 modules["vendor/QRCode/QR8bitByte"]=function(module,exports,require){
 var QRMode = require('./QRMode');
 
@@ -980,7 +931,7 @@ QR8bitByte.prototype = {
 	getLength : function() {
 		return this.data.length;
 	},
-	
+
 	write : function(buffer) {
 		for (var i = 0; i < this.data.length; i++) {
 			// not JIS ...
@@ -992,6 +943,116 @@ QR8bitByte.prototype = {
 module.exports = QR8bitByte;
 
 };
+modules["vendor/QRCode/QRBitBuffer"]=function(module,exports,require){
+function QRBitBuffer() {
+	this.buffer = [];
+	this.length = 0;
+}
+
+QRBitBuffer.prototype = {
+
+	get : function(index) {
+		var bufIndex = Math.floor(index / 8);
+		return ( (this.buffer[bufIndex] >>> (7 - index % 8) ) & 1) == 1;
+	},
+
+	put : function(num, length) {
+		for (var i = 0; i < length; i++) {
+			this.putBit( ( (num >>> (length - i - 1) ) & 1) == 1);
+		}
+	},
+
+	getLengthInBits : function() {
+		return this.length;
+	},
+
+	putBit : function(bit) {
+
+		var bufIndex = Math.floor(this.length / 8);
+		if (this.buffer.length <= bufIndex) {
+			this.buffer.push(0);
+		}
+
+		if (bit) {
+			this.buffer[bufIndex] |= (0x80 >>> (this.length % 8) );
+		}
+
+		this.length++;
+	}
+};
+
+module.exports = QRBitBuffer;
+
+};
+modules["vendor/QRCode/QRErrorCorrectLevel"]=function(module,exports,require){
+module.exports = {
+	L : 1,
+	M : 0,
+	Q : 3,
+	H : 2
+};
+
+};
+modules["vendor/QRCode/QRMaskPattern"]=function(module,exports,require){
+module.exports = {
+	PATTERN000 : 0,
+	PATTERN001 : 1,
+	PATTERN010 : 2,
+	PATTERN011 : 3,
+	PATTERN100 : 4,
+	PATTERN101 : 5,
+	PATTERN110 : 6,
+	PATTERN111 : 7
+};
+
+};
+modules["vendor/QRCode/QRMath"]=function(module,exports,require){
+var QRMath = {
+
+	glog : function(n) {
+
+		if (n < 1) {
+			throw new Error("glog(" + n + ")");
+		}
+
+		return QRMath.LOG_TABLE[n];
+	},
+
+	gexp : function(n) {
+
+		while (n < 0) {
+			n += 255;
+		}
+
+		while (n >= 256) {
+			n -= 255;
+		}
+
+		return QRMath.EXP_TABLE[n];
+	},
+
+	EXP_TABLE : new Array(256),
+
+	LOG_TABLE : new Array(256)
+
+};
+
+for (var i = 0; i < 8; i++) {
+	QRMath.EXP_TABLE[i] = 1 << i;
+}
+for (var i = 8; i < 256; i++) {
+	QRMath.EXP_TABLE[i] = QRMath.EXP_TABLE[i - 4]
+		^ QRMath.EXP_TABLE[i - 5]
+		^ QRMath.EXP_TABLE[i - 6]
+		^ QRMath.EXP_TABLE[i - 8];
+}
+for (var i = 0; i < 255; i++) {
+	QRMath.LOG_TABLE[QRMath.EXP_TABLE[i] ] = i;
+}
+
+module.exports = QRMath;
+
+};
 modules["vendor/QRCode/QRMode"]=function(module,exports,require){
 module.exports = {
     MODE_NUMBER :       1 << 0,
@@ -999,281 +1060,6 @@ module.exports = {
     MODE_8BIT_BYTE :    1 << 2,
     MODE_KANJI :        1 << 3
 };
-
-};
-modules["vendor/QRCode/QRUtil"]=function(module,exports,require){
-var QRMode = require('./QRMode');
-var QRPolynomial = require('./QRPolynomial');
-var QRMath = require('./QRMath');
-var QRMaskPattern = require('./QRMaskPattern');
-
-var QRUtil = {
-
-    PATTERN_POSITION_TABLE : [
-        [],
-        [6, 18],
-        [6, 22],
-        [6, 26],
-        [6, 30],
-        [6, 34],
-        [6, 22, 38],
-        [6, 24, 42],
-        [6, 26, 46],
-        [6, 28, 50],
-        [6, 30, 54],        
-        [6, 32, 58],
-        [6, 34, 62],
-        [6, 26, 46, 66],
-        [6, 26, 48, 70],
-        [6, 26, 50, 74],
-        [6, 30, 54, 78],
-        [6, 30, 56, 82],
-        [6, 30, 58, 86],
-        [6, 34, 62, 90],
-        [6, 28, 50, 72, 94],
-        [6, 26, 50, 74, 98],
-        [6, 30, 54, 78, 102],
-        [6, 28, 54, 80, 106],
-        [6, 32, 58, 84, 110],
-        [6, 30, 58, 86, 114],
-        [6, 34, 62, 90, 118],
-        [6, 26, 50, 74, 98, 122],
-        [6, 30, 54, 78, 102, 126],
-        [6, 26, 52, 78, 104, 130],
-        [6, 30, 56, 82, 108, 134],
-        [6, 34, 60, 86, 112, 138],
-        [6, 30, 58, 86, 114, 142],
-        [6, 34, 62, 90, 118, 146],
-        [6, 30, 54, 78, 102, 126, 150],
-        [6, 24, 50, 76, 102, 128, 154],
-        [6, 28, 54, 80, 106, 132, 158],
-        [6, 32, 58, 84, 110, 136, 162],
-        [6, 26, 54, 82, 110, 138, 166],
-        [6, 30, 58, 86, 114, 142, 170]
-    ],
-
-    G15 : (1 << 10) | (1 << 8) | (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1) | (1 << 0),
-    G18 : (1 << 12) | (1 << 11) | (1 << 10) | (1 << 9) | (1 << 8) | (1 << 5) | (1 << 2) | (1 << 0),
-    G15_MASK : (1 << 14) | (1 << 12) | (1 << 10)    | (1 << 4) | (1 << 1),
-
-    getBCHTypeInfo : function(data) {
-        var d = data << 10;
-        while (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(QRUtil.G15) >= 0) {
-            d ^= (QRUtil.G15 << (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(QRUtil.G15) ) );    
-        }
-        return ( (data << 10) | d) ^ QRUtil.G15_MASK;
-    },
-
-    getBCHTypeNumber : function(data) {
-        var d = data << 12;
-        while (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(QRUtil.G18) >= 0) {
-            d ^= (QRUtil.G18 << (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(QRUtil.G18) ) );    
-        }
-        return (data << 12) | d;
-    },
-
-    getBCHDigit : function(data) {
-
-        var digit = 0;
-
-        while (data !== 0) {
-            digit++;
-            data >>>= 1;
-        }
-
-        return digit;
-    },
-
-    getPatternPosition : function(typeNumber) {
-        return QRUtil.PATTERN_POSITION_TABLE[typeNumber - 1];
-    },
-
-    getMask : function(maskPattern, i, j) {
-        
-        switch (maskPattern) {
-            
-        case QRMaskPattern.PATTERN000 : return (i + j) % 2 === 0;
-        case QRMaskPattern.PATTERN001 : return i % 2 === 0;
-        case QRMaskPattern.PATTERN010 : return j % 3 === 0;
-        case QRMaskPattern.PATTERN011 : return (i + j) % 3 === 0;
-        case QRMaskPattern.PATTERN100 : return (Math.floor(i / 2) + Math.floor(j / 3) ) % 2 === 0;
-        case QRMaskPattern.PATTERN101 : return (i * j) % 2 + (i * j) % 3 === 0;
-        case QRMaskPattern.PATTERN110 : return ( (i * j) % 2 + (i * j) % 3) % 2 === 0;
-        case QRMaskPattern.PATTERN111 : return ( (i * j) % 3 + (i + j) % 2) % 2 === 0;
-
-        default :
-            throw new Error("bad maskPattern:" + maskPattern);
-        }
-    },
-
-    getErrorCorrectPolynomial : function(errorCorrectLength) {
-
-        var a = new QRPolynomial([1], 0);
-
-        for (var i = 0; i < errorCorrectLength; i++) {
-            a = a.multiply(new QRPolynomial([1, QRMath.gexp(i)], 0) );
-        }
-
-        return a;
-    },
-
-    getLengthInBits : function(mode, type) {
-
-        if (1 <= type && type < 10) {
-
-            // 1 - 9
-
-            switch(mode) {
-            case QRMode.MODE_NUMBER     : return 10;
-            case QRMode.MODE_ALPHA_NUM  : return 9;
-            case QRMode.MODE_8BIT_BYTE  : return 8;
-            case QRMode.MODE_KANJI      : return 8;
-            default :
-                throw new Error("mode:" + mode);
-            }
-
-        } else if (type < 27) {
-
-            // 10 - 26
-
-            switch(mode) {
-            case QRMode.MODE_NUMBER     : return 12;
-            case QRMode.MODE_ALPHA_NUM  : return 11;
-            case QRMode.MODE_8BIT_BYTE  : return 16;
-            case QRMode.MODE_KANJI      : return 10;
-            default :
-                throw new Error("mode:" + mode);
-            }
-
-        } else if (type < 41) {
-
-            // 27 - 40
-
-            switch(mode) {
-            case QRMode.MODE_NUMBER     : return 14;
-            case QRMode.MODE_ALPHA_NUM  : return 13;
-            case QRMode.MODE_8BIT_BYTE  : return 16;
-            case QRMode.MODE_KANJI      : return 12;
-            default :
-                throw new Error("mode:" + mode);
-            }
-
-        } else {
-            throw new Error("type:" + type);
-        }
-    },
-
-    getLostPoint : function(qrCode) {
-        
-        var moduleCount = qrCode.getModuleCount();
-        var lostPoint = 0;
-        var row = 0; 
-        var col = 0;
-
-        
-        // LEVEL1
-        
-        for (row = 0; row < moduleCount; row++) {
-
-            for (col = 0; col < moduleCount; col++) {
-
-                var sameCount = 0;
-                var dark = qrCode.isDark(row, col);
-
-                for (var r = -1; r <= 1; r++) {
-
-                    if (row + r < 0 || moduleCount <= row + r) {
-                        continue;
-                    }
-
-                    for (var c = -1; c <= 1; c++) {
-
-                        if (col + c < 0 || moduleCount <= col + c) {
-                            continue;
-                        }
-
-                        if (r === 0 && c === 0) {
-                            continue;
-                        }
-
-                        if (dark === qrCode.isDark(row + r, col + c) ) {
-                            sameCount++;
-                        }
-                    }
-                }
-
-                if (sameCount > 5) {
-                    lostPoint += (3 + sameCount - 5);
-                }
-            }
-        }
-
-        // LEVEL2
-
-        for (row = 0; row < moduleCount - 1; row++) {
-            for (col = 0; col < moduleCount - 1; col++) {
-                var count = 0;
-                if (qrCode.isDark(row,     col    ) ) count++;
-                if (qrCode.isDark(row + 1, col    ) ) count++;
-                if (qrCode.isDark(row,     col + 1) ) count++;
-                if (qrCode.isDark(row + 1, col + 1) ) count++;
-                if (count === 0 || count === 4) {
-                    lostPoint += 3;
-                }
-            }
-        }
-
-        // LEVEL3
-
-        for (row = 0; row < moduleCount; row++) {
-            for (col = 0; col < moduleCount - 6; col++) {
-                if (qrCode.isDark(row, col) && 
-                        !qrCode.isDark(row, col + 1) && 
-                         qrCode.isDark(row, col + 2) && 
-                         qrCode.isDark(row, col + 3) && 
-                         qrCode.isDark(row, col + 4) && 
-                        !qrCode.isDark(row, col + 5) && 
-                         qrCode.isDark(row, col + 6) ) {
-                    lostPoint += 40;
-                }
-            }
-        }
-
-        for (col = 0; col < moduleCount; col++) {
-            for (row = 0; row < moduleCount - 6; row++) {
-                if (qrCode.isDark(row, col) &&
-                        !qrCode.isDark(row + 1, col) &&
-                         qrCode.isDark(row + 2, col) &&
-                         qrCode.isDark(row + 3, col) &&
-                         qrCode.isDark(row + 4, col) &&
-                        !qrCode.isDark(row + 5, col) &&
-                         qrCode.isDark(row + 6, col) ) {
-                    lostPoint += 40;
-                }
-            }
-        }
-
-        // LEVEL4
-        
-        var darkCount = 0;
-
-        for (col = 0; col < moduleCount; col++) {
-            for (row = 0; row < moduleCount; row++) {
-                if (qrCode.isDark(row, col) ) {
-                    darkCount++;
-                }
-            }
-        }
-        
-        var ratio = Math.abs(100 * darkCount / moduleCount / moduleCount - 50) / 5;
-        lostPoint += ratio * 10;
-
-        return lostPoint;       
-    }
-
-};
-
-module.exports = QRUtil;
 
 };
 modules["vendor/QRCode/QRPolynomial"]=function(module,exports,require){
@@ -1301,108 +1087,48 @@ QRPolynomial.prototype = {
 	get : function(index) {
 		return this.num[index];
 	},
-	
+
 	getLength : function() {
 		return this.num.length;
 	},
-	
+
 	multiply : function(e) {
-	
+
 		var num = new Array(this.getLength() + e.getLength() - 1);
-	
+
 		for (var i = 0; i < this.getLength(); i++) {
 			for (var j = 0; j < e.getLength(); j++) {
 				num[i + j] ^= QRMath.gexp(QRMath.glog(this.get(i) ) + QRMath.glog(e.get(j) ) );
 			}
 		}
-	
+
 		return new QRPolynomial(num, 0);
 	},
-	
+
 	mod : function(e) {
-	
+
 		if (this.getLength() - e.getLength() < 0) {
 			return this;
 		}
-	
+
 		var ratio = QRMath.glog(this.get(0) ) - QRMath.glog(e.get(0) );
-	
+
 		var num = new Array(this.getLength() );
-		
+
 		for (var i = 0; i < this.getLength(); i++) {
 			num[i] = this.get(i);
 		}
-		
+
 		for (var x = 0; x < e.getLength(); x++) {
 			num[x] ^= QRMath.gexp(QRMath.glog(e.get(x) ) + ratio);
 		}
-	
+
 		// recursive call
 		return new QRPolynomial(num, 0).mod(e);
 	}
 };
 
 module.exports = QRPolynomial;
-
-};
-modules["vendor/QRCode/QRMath"]=function(module,exports,require){
-var QRMath = {
-
-	glog : function(n) {
-	
-		if (n < 1) {
-			throw new Error("glog(" + n + ")");
-		}
-		
-		return QRMath.LOG_TABLE[n];
-	},
-	
-	gexp : function(n) {
-	
-		while (n < 0) {
-			n += 255;
-		}
-	
-		while (n >= 256) {
-			n -= 255;
-		}
-	
-		return QRMath.EXP_TABLE[n];
-	},
-	
-	EXP_TABLE : new Array(256),
-	
-	LOG_TABLE : new Array(256)
-
-};
-	
-for (var i = 0; i < 8; i++) {
-	QRMath.EXP_TABLE[i] = 1 << i;
-}
-for (var i = 8; i < 256; i++) {
-	QRMath.EXP_TABLE[i] = QRMath.EXP_TABLE[i - 4]
-		^ QRMath.EXP_TABLE[i - 5]
-		^ QRMath.EXP_TABLE[i - 6]
-		^ QRMath.EXP_TABLE[i - 8];
-}
-for (var i = 0; i < 255; i++) {
-	QRMath.LOG_TABLE[QRMath.EXP_TABLE[i] ] = i;
-}
-
-module.exports = QRMath;
-
-};
-modules["vendor/QRCode/QRMaskPattern"]=function(module,exports,require){
-module.exports = {
-	PATTERN000 : 0,
-	PATTERN001 : 1,
-	PATTERN010 : 2,
-	PATTERN011 : 3,
-	PATTERN100 : 4,
-	PATTERN101 : 5,
-	PATTERN110 : 6,
-	PATTERN111 : 7
-};
 
 };
 modules["vendor/QRCode/QRRSBlock"]=function(module,exports,require){
@@ -1425,7 +1151,7 @@ QRRSBlock.RS_BLOCK_TABLE = [
 	[1, 26, 16],
 	[1, 26, 13],
 	[1, 26, 9],
-	
+
 	// 2
 	[1, 44, 34],
 	[1, 44, 28],
@@ -1438,43 +1164,43 @@ QRRSBlock.RS_BLOCK_TABLE = [
 	[2, 35, 17],
 	[2, 35, 13],
 
-	// 4		
+	// 4
 	[1, 100, 80],
 	[2, 50, 32],
 	[2, 50, 24],
 	[4, 25, 9],
-	
+
 	// 5
 	[1, 134, 108],
 	[2, 67, 43],
 	[2, 33, 15, 2, 34, 16],
 	[2, 33, 11, 2, 34, 12],
-	
+
 	// 6
 	[2, 86, 68],
 	[4, 43, 27],
 	[4, 43, 19],
 	[4, 43, 15],
-	
-	// 7		
+
+	// 7
 	[2, 98, 78],
 	[4, 49, 31],
 	[2, 32, 14, 4, 33, 15],
 	[4, 39, 13, 1, 40, 14],
-	
+
 	// 8
 	[2, 121, 97],
 	[2, 60, 38, 2, 61, 39],
 	[4, 40, 18, 2, 41, 19],
 	[4, 40, 14, 2, 41, 15],
-	
+
 	// 9
 	[2, 146, 116],
 	[3, 58, 36, 2, 59, 37],
 	[4, 36, 16, 4, 37, 17],
 	[4, 36, 12, 4, 37, 13],
-	
-	// 10		
+
+	// 10
 	[2, 86, 68, 2, 87, 69],
 	[4, 69, 43, 1, 70, 44],
 	[6, 43, 19, 2, 44, 20],
@@ -1662,17 +1388,17 @@ QRRSBlock.RS_BLOCK_TABLE = [
 ];
 
 QRRSBlock.getRSBlocks = function(typeNumber, errorCorrectLevel) {
-	
+
 	var rsBlock = QRRSBlock.getRsBlockTable(typeNumber, errorCorrectLevel);
-	
+
 	if (rsBlock === undefined) {
 		throw new Error("bad rs block @ typeNumber:" + typeNumber + "/errorCorrectLevel:" + errorCorrectLevel);
 	}
 
 	var length = rsBlock.length / 3;
-	
+
 	var list = [];
-	
+
 	for (var i = 0; i < length; i++) {
 
 		var count = rsBlock[i * 3 + 0];
@@ -1680,10 +1406,10 @@ QRRSBlock.getRSBlocks = function(typeNumber, errorCorrectLevel) {
 		var dataCount  = rsBlock[i * 3 + 2];
 
 		for (var j = 0; j < count; j++) {
-			list.push(new QRRSBlock(totalCount, dataCount) );	
+			list.push(new QRRSBlock(totalCount, dataCount) );
 		}
 	}
-	
+
 	return list;
 };
 
@@ -1706,57 +1432,763 @@ QRRSBlock.getRsBlockTable = function(typeNumber, errorCorrectLevel) {
 module.exports = QRRSBlock;
 
 };
-modules["vendor/QRCode/QRErrorCorrectLevel"]=function(module,exports,require){
-module.exports = {
-	L : 1,
-	M : 0,
-	Q : 3,
-	H : 2
-};
+modules["vendor/QRCode/QRUtil"]=function(module,exports,require){
+var QRMode = require('./QRMode');
+var QRPolynomial = require('./QRPolynomial');
+var QRMath = require('./QRMath');
+var QRMaskPattern = require('./QRMaskPattern');
+
+var QRUtil = {
+
+    PATTERN_POSITION_TABLE : [
+        [],
+        [6, 18],
+        [6, 22],
+        [6, 26],
+        [6, 30],
+        [6, 34],
+        [6, 22, 38],
+        [6, 24, 42],
+        [6, 26, 46],
+        [6, 28, 50],
+        [6, 30, 54],
+        [6, 32, 58],
+        [6, 34, 62],
+        [6, 26, 46, 66],
+        [6, 26, 48, 70],
+        [6, 26, 50, 74],
+        [6, 30, 54, 78],
+        [6, 30, 56, 82],
+        [6, 30, 58, 86],
+        [6, 34, 62, 90],
+        [6, 28, 50, 72, 94],
+        [6, 26, 50, 74, 98],
+        [6, 30, 54, 78, 102],
+        [6, 28, 54, 80, 106],
+        [6, 32, 58, 84, 110],
+        [6, 30, 58, 86, 114],
+        [6, 34, 62, 90, 118],
+        [6, 26, 50, 74, 98, 122],
+        [6, 30, 54, 78, 102, 126],
+        [6, 26, 52, 78, 104, 130],
+        [6, 30, 56, 82, 108, 134],
+        [6, 34, 60, 86, 112, 138],
+        [6, 30, 58, 86, 114, 142],
+        [6, 34, 62, 90, 118, 146],
+        [6, 30, 54, 78, 102, 126, 150],
+        [6, 24, 50, 76, 102, 128, 154],
+        [6, 28, 54, 80, 106, 132, 158],
+        [6, 32, 58, 84, 110, 136, 162],
+        [6, 26, 54, 82, 110, 138, 166],
+        [6, 30, 58, 86, 114, 142, 170]
+    ],
+
+    G15 : (1 << 10) | (1 << 8) | (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1) | (1 << 0),
+    G18 : (1 << 12) | (1 << 11) | (1 << 10) | (1 << 9) | (1 << 8) | (1 << 5) | (1 << 2) | (1 << 0),
+    G15_MASK : (1 << 14) | (1 << 12) | (1 << 10)    | (1 << 4) | (1 << 1),
+
+    getBCHTypeInfo : function(data) {
+        var d = data << 10;
+        while (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(QRUtil.G15) >= 0) {
+            d ^= (QRUtil.G15 << (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(QRUtil.G15) ) );
+        }
+        return ( (data << 10) | d) ^ QRUtil.G15_MASK;
+    },
+
+    getBCHTypeNumber : function(data) {
+        var d = data << 12;
+        while (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(QRUtil.G18) >= 0) {
+            d ^= (QRUtil.G18 << (QRUtil.getBCHDigit(d) - QRUtil.getBCHDigit(QRUtil.G18) ) );
+        }
+        return (data << 12) | d;
+    },
+
+    getBCHDigit : function(data) {
+
+        var digit = 0;
+
+        while (data !== 0) {
+            digit++;
+            data >>>= 1;
+        }
+
+        return digit;
+    },
+
+    getPatternPosition : function(typeNumber) {
+        return QRUtil.PATTERN_POSITION_TABLE[typeNumber - 1];
+    },
+
+    getMask : function(maskPattern, i, j) {
+
+        switch (maskPattern) {
+
+        case QRMaskPattern.PATTERN000 : return (i + j) % 2 === 0;
+        case QRMaskPattern.PATTERN001 : return i % 2 === 0;
+        case QRMaskPattern.PATTERN010 : return j % 3 === 0;
+        case QRMaskPattern.PATTERN011 : return (i + j) % 3 === 0;
+        case QRMaskPattern.PATTERN100 : return (Math.floor(i / 2) + Math.floor(j / 3) ) % 2 === 0;
+        case QRMaskPattern.PATTERN101 : return (i * j) % 2 + (i * j) % 3 === 0;
+        case QRMaskPattern.PATTERN110 : return ( (i * j) % 2 + (i * j) % 3) % 2 === 0;
+        case QRMaskPattern.PATTERN111 : return ( (i * j) % 3 + (i + j) % 2) % 2 === 0;
+
+        default :
+            throw new Error("bad maskPattern:" + maskPattern);
+        }
+    },
+
+    getErrorCorrectPolynomial : function(errorCorrectLength) {
+
+        var a = new QRPolynomial([1], 0);
+
+        for (var i = 0; i < errorCorrectLength; i++) {
+            a = a.multiply(new QRPolynomial([1, QRMath.gexp(i)], 0) );
+        }
+
+        return a;
+    },
+
+    getLengthInBits : function(mode, type) {
+
+        if (1 <= type && type < 10) {
+
+            // 1 - 9
+
+            switch(mode) {
+            case QRMode.MODE_NUMBER     : return 10;
+            case QRMode.MODE_ALPHA_NUM  : return 9;
+            case QRMode.MODE_8BIT_BYTE  : return 8;
+            case QRMode.MODE_KANJI      : return 8;
+            default :
+                throw new Error("mode:" + mode);
+            }
+
+        } else if (type < 27) {
+
+            // 10 - 26
+
+            switch(mode) {
+            case QRMode.MODE_NUMBER     : return 12;
+            case QRMode.MODE_ALPHA_NUM  : return 11;
+            case QRMode.MODE_8BIT_BYTE  : return 16;
+            case QRMode.MODE_KANJI      : return 10;
+            default :
+                throw new Error("mode:" + mode);
+            }
+
+        } else if (type < 41) {
+
+            // 27 - 40
+
+            switch(mode) {
+            case QRMode.MODE_NUMBER     : return 14;
+            case QRMode.MODE_ALPHA_NUM  : return 13;
+            case QRMode.MODE_8BIT_BYTE  : return 16;
+            case QRMode.MODE_KANJI      : return 12;
+            default :
+                throw new Error("mode:" + mode);
+            }
+
+        } else {
+            throw new Error("type:" + type);
+        }
+    },
+
+    getLostPoint : function(qrCode) {
+
+        var moduleCount = qrCode.getModuleCount();
+        var lostPoint = 0;
+        var row = 0;
+        var col = 0;
 
 
+        // LEVEL1
+
+        for (row = 0; row < moduleCount; row++) {
+
+            for (col = 0; col < moduleCount; col++) {
+
+                var sameCount = 0;
+                var dark = qrCode.isDark(row, col);
+
+                for (var r = -1; r <= 1; r++) {
+
+                    if (row + r < 0 || moduleCount <= row + r) {
+                        continue;
+                    }
+
+                    for (var c = -1; c <= 1; c++) {
+
+                        if (col + c < 0 || moduleCount <= col + c) {
+                            continue;
+                        }
+
+                        if (r === 0 && c === 0) {
+                            continue;
+                        }
+
+                        if (dark === qrCode.isDark(row + r, col + c) ) {
+                            sameCount++;
+                        }
+                    }
+                }
+
+                if (sameCount > 5) {
+                    lostPoint += (3 + sameCount - 5);
+                }
+            }
+        }
+
+        // LEVEL2
+
+        for (row = 0; row < moduleCount - 1; row++) {
+            for (col = 0; col < moduleCount - 1; col++) {
+                var count = 0;
+                if (qrCode.isDark(row,     col    ) ) count++;
+                if (qrCode.isDark(row + 1, col    ) ) count++;
+                if (qrCode.isDark(row,     col + 1) ) count++;
+                if (qrCode.isDark(row + 1, col + 1) ) count++;
+                if (count === 0 || count === 4) {
+                    lostPoint += 3;
+                }
+            }
+        }
+
+        // LEVEL3
+
+        for (row = 0; row < moduleCount; row++) {
+            for (col = 0; col < moduleCount - 6; col++) {
+                if (qrCode.isDark(row, col) &&
+                        !qrCode.isDark(row, col + 1) &&
+                         qrCode.isDark(row, col + 2) &&
+                         qrCode.isDark(row, col + 3) &&
+                         qrCode.isDark(row, col + 4) &&
+                        !qrCode.isDark(row, col + 5) &&
+                         qrCode.isDark(row, col + 6) ) {
+                    lostPoint += 40;
+                }
+            }
+        }
+
+        for (col = 0; col < moduleCount; col++) {
+            for (row = 0; row < moduleCount - 6; row++) {
+                if (qrCode.isDark(row, col) &&
+                        !qrCode.isDark(row + 1, col) &&
+                         qrCode.isDark(row + 2, col) &&
+                         qrCode.isDark(row + 3, col) &&
+                         qrCode.isDark(row + 4, col) &&
+                        !qrCode.isDark(row + 5, col) &&
+                         qrCode.isDark(row + 6, col) ) {
+                    lostPoint += 40;
+                }
+            }
+        }
+
+        // LEVEL4
+
+        var darkCount = 0;
+
+        for (col = 0; col < moduleCount; col++) {
+            for (row = 0; row < moduleCount; row++) {
+                if (qrCode.isDark(row, col) ) {
+                    darkCount++;
+                }
+            }
+        }
+
+        var ratio = Math.abs(100 * darkCount / moduleCount / moduleCount - 50) / 5;
+        lostPoint += ratio * 10;
+
+        return lostPoint;
+    }
+
 };
-modules["vendor/QRCode/QRBitBuffer"]=function(module,exports,require){
-function QRBitBuffer() {
-	this.buffer = [];
-	this.length = 0;
+
+module.exports = QRUtil;
+
+};
+modules["vendor/QRCode/index"]=function(module,exports,require){
+//---------------------------------------------------------------------
+// QRCode for JavaScript
+//
+// Copyright (c) 2009 Kazuhiko Arase
+//
+// URL: http://www.d-project.com/
+//
+// Licensed under the MIT license:
+//   http://www.opensource.org/licenses/mit-license.php
+//
+// The word "QR Code" is registered trademark of
+// DENSO WAVE INCORPORATED
+//   http://www.denso-wave.com/qrcode/faqpatent-e.html
+//
+//---------------------------------------------------------------------
+// Modified to work in node for this project (and some refactoring)
+//---------------------------------------------------------------------
+
+var QR8bitByte = require('./QR8bitByte');
+var QRUtil = require('./QRUtil');
+var QRPolynomial = require('./QRPolynomial');
+var QRRSBlock = require('./QRRSBlock');
+var QRBitBuffer = require('./QRBitBuffer');
+
+function QRCode(typeNumber, errorCorrectLevel) {
+	this.typeNumber = typeNumber;
+	this.errorCorrectLevel = errorCorrectLevel;
+	this.modules = null;
+	this.moduleCount = 0;
+	this.dataCache = null;
+	this.dataList = [];
 }
 
-QRBitBuffer.prototype = {
+QRCode.prototype = {
 
-	get : function(index) {
-		var bufIndex = Math.floor(index / 8);
-		return ( (this.buffer[bufIndex] >>> (7 - index % 8) ) & 1) == 1;
+	addData : function(data) {
+		var newData = new QR8bitByte(data);
+		this.dataList.push(newData);
+		this.dataCache = null;
 	},
-	
-	put : function(num, length) {
-		for (var i = 0; i < length; i++) {
-			this.putBit( ( (num >>> (length - i - 1) ) & 1) == 1);
+
+	isDark : function(row, col) {
+		if (row < 0 || this.moduleCount <= row || col < 0 || this.moduleCount <= col) {
+			throw new Error(row + "," + col);
+		}
+		return this.modules[row][col];
+	},
+
+	getModuleCount : function() {
+		return this.moduleCount;
+	},
+
+	make : function() {
+		// Calculate automatically typeNumber if provided is < 1
+		if (this.typeNumber < 1 ){
+			var typeNumber = 1;
+			for (typeNumber = 1; typeNumber < 40; typeNumber++) {
+				var rsBlocks = QRRSBlock.getRSBlocks(typeNumber, this.errorCorrectLevel);
+
+				var buffer = new QRBitBuffer();
+				var totalDataCount = 0;
+				for (var i = 0; i < rsBlocks.length; i++) {
+					totalDataCount += rsBlocks[i].dataCount;
+				}
+
+				for (var x = 0; x < this.dataList.length; x++) {
+					var data = this.dataList[x];
+					buffer.put(data.mode, 4);
+					buffer.put(data.getLength(), QRUtil.getLengthInBits(data.mode, typeNumber) );
+					data.write(buffer);
+				}
+				if (buffer.getLengthInBits() <= totalDataCount * 8)
+					break;
+			}
+			this.typeNumber = typeNumber;
+		}
+		this.makeImpl(false, this.getBestMaskPattern() );
+	},
+
+	makeImpl : function(test, maskPattern) {
+
+		this.moduleCount = this.typeNumber * 4 + 17;
+		this.modules = new Array(this.moduleCount);
+
+		for (var row = 0; row < this.moduleCount; row++) {
+
+			this.modules[row] = new Array(this.moduleCount);
+
+			for (var col = 0; col < this.moduleCount; col++) {
+				this.modules[row][col] = null;//(col + row) % 3;
+			}
+		}
+
+		this.setupPositionProbePattern(0, 0);
+		this.setupPositionProbePattern(this.moduleCount - 7, 0);
+		this.setupPositionProbePattern(0, this.moduleCount - 7);
+		this.setupPositionAdjustPattern();
+		this.setupTimingPattern();
+		this.setupTypeInfo(test, maskPattern);
+
+		if (this.typeNumber >= 7) {
+			this.setupTypeNumber(test);
+		}
+
+		if (this.dataCache === null) {
+			this.dataCache = QRCode.createData(this.typeNumber, this.errorCorrectLevel, this.dataList);
+		}
+
+		this.mapData(this.dataCache, maskPattern);
+	},
+
+	setupPositionProbePattern : function(row, col)  {
+
+		for (var r = -1; r <= 7; r++) {
+
+			if (row + r <= -1 || this.moduleCount <= row + r) continue;
+
+			for (var c = -1; c <= 7; c++) {
+
+				if (col + c <= -1 || this.moduleCount <= col + c) continue;
+
+				if ( (0 <= r && r <= 6 && (c === 0 || c === 6) ) ||
+                     (0 <= c && c <= 6 && (r === 0 || r === 6) ) ||
+                     (2 <= r && r <= 4 && 2 <= c && c <= 4) ) {
+					this.modules[row + r][col + c] = true;
+				} else {
+					this.modules[row + r][col + c] = false;
+				}
+			}
 		}
 	},
-	
-	getLengthInBits : function() {
-		return this.length;
+
+	getBestMaskPattern : function() {
+
+		var minLostPoint = 0;
+		var pattern = 0;
+
+		for (var i = 0; i < 8; i++) {
+
+			this.makeImpl(true, i);
+
+			var lostPoint = QRUtil.getLostPoint(this);
+
+			if (i === 0 || minLostPoint >  lostPoint) {
+				minLostPoint = lostPoint;
+				pattern = i;
+			}
+		}
+
+		return pattern;
 	},
-	
-	putBit : function(bit) {
-	
-		var bufIndex = Math.floor(this.length / 8);
-		if (this.buffer.length <= bufIndex) {
-			this.buffer.push(0);
+
+	createMovieClip : function(target_mc, instance_name, depth) {
+
+		var qr_mc = target_mc.createEmptyMovieClip(instance_name, depth);
+		var cs = 1;
+
+		this.make();
+
+		for (var row = 0; row < this.modules.length; row++) {
+
+			var y = row * cs;
+
+			for (var col = 0; col < this.modules[row].length; col++) {
+
+				var x = col * cs;
+				var dark = this.modules[row][col];
+
+				if (dark) {
+					qr_mc.beginFill(0, 100);
+					qr_mc.moveTo(x, y);
+					qr_mc.lineTo(x + cs, y);
+					qr_mc.lineTo(x + cs, y + cs);
+					qr_mc.lineTo(x, y + cs);
+					qr_mc.endFill();
+				}
+			}
 		}
-	
-		if (bit) {
-			this.buffer[bufIndex] |= (0x80 >>> (this.length % 8) );
+
+		return qr_mc;
+	},
+
+	setupTimingPattern : function() {
+
+		for (var r = 8; r < this.moduleCount - 8; r++) {
+			if (this.modules[r][6] !== null) {
+				continue;
+			}
+			this.modules[r][6] = (r % 2 === 0);
 		}
-	
-		this.length++;
+
+		for (var c = 8; c < this.moduleCount - 8; c++) {
+			if (this.modules[6][c] !== null) {
+				continue;
+			}
+			this.modules[6][c] = (c % 2 === 0);
+		}
+	},
+
+	setupPositionAdjustPattern : function() {
+
+		var pos = QRUtil.getPatternPosition(this.typeNumber);
+
+		for (var i = 0; i < pos.length; i++) {
+
+			for (var j = 0; j < pos.length; j++) {
+
+				var row = pos[i];
+				var col = pos[j];
+
+				if (this.modules[row][col] !== null) {
+					continue;
+				}
+
+				for (var r = -2; r <= 2; r++) {
+
+					for (var c = -2; c <= 2; c++) {
+
+						if (Math.abs(r) === 2 ||
+                            Math.abs(c) === 2 ||
+                            (r === 0 && c === 0) ) {
+							this.modules[row + r][col + c] = true;
+						} else {
+							this.modules[row + r][col + c] = false;
+						}
+					}
+				}
+			}
+		}
+	},
+
+	setupTypeNumber : function(test) {
+
+		var bits = QRUtil.getBCHTypeNumber(this.typeNumber);
+        var mod;
+
+		for (var i = 0; i < 18; i++) {
+			mod = (!test && ( (bits >> i) & 1) === 1);
+			this.modules[Math.floor(i / 3)][i % 3 + this.moduleCount - 8 - 3] = mod;
+		}
+
+		for (var x = 0; x < 18; x++) {
+			mod = (!test && ( (bits >> x) & 1) === 1);
+			this.modules[x % 3 + this.moduleCount - 8 - 3][Math.floor(x / 3)] = mod;
+		}
+	},
+
+	setupTypeInfo : function(test, maskPattern) {
+
+		var data = (this.errorCorrectLevel << 3) | maskPattern;
+		var bits = QRUtil.getBCHTypeInfo(data);
+        var mod;
+
+		// vertical
+		for (var v = 0; v < 15; v++) {
+
+			mod = (!test && ( (bits >> v) & 1) === 1);
+
+			if (v < 6) {
+				this.modules[v][8] = mod;
+			} else if (v < 8) {
+				this.modules[v + 1][8] = mod;
+			} else {
+				this.modules[this.moduleCount - 15 + v][8] = mod;
+			}
+		}
+
+		// horizontal
+		for (var h = 0; h < 15; h++) {
+
+			mod = (!test && ( (bits >> h) & 1) === 1);
+
+			if (h < 8) {
+				this.modules[8][this.moduleCount - h - 1] = mod;
+			} else if (h < 9) {
+				this.modules[8][15 - h - 1 + 1] = mod;
+			} else {
+				this.modules[8][15 - h - 1] = mod;
+			}
+		}
+
+		// fixed module
+		this.modules[this.moduleCount - 8][8] = (!test);
+
+	},
+
+	mapData : function(data, maskPattern) {
+
+		var inc = -1;
+		var row = this.moduleCount - 1;
+		var bitIndex = 7;
+		var byteIndex = 0;
+
+		for (var col = this.moduleCount - 1; col > 0; col -= 2) {
+
+			if (col === 6) col--;
+
+			while (true) {
+
+				for (var c = 0; c < 2; c++) {
+
+					if (this.modules[row][col - c] === null) {
+
+						var dark = false;
+
+						if (byteIndex < data.length) {
+							dark = ( ( (data[byteIndex] >>> bitIndex) & 1) === 1);
+						}
+
+						var mask = QRUtil.getMask(maskPattern, row, col - c);
+
+						if (mask) {
+							dark = !dark;
+						}
+
+						this.modules[row][col - c] = dark;
+						bitIndex--;
+
+						if (bitIndex === -1) {
+							byteIndex++;
+							bitIndex = 7;
+						}
+					}
+				}
+
+				row += inc;
+
+				if (row < 0 || this.moduleCount <= row) {
+					row -= inc;
+					inc = -inc;
+					break;
+				}
+			}
+		}
+
 	}
-};
-
-module.exports = QRBitBuffer;
 
 };
-function internal(id){if(cache[id])return cache[id].exports;const factory=modules[id];if(!factory) return require(id);const mod={exports:{}};cache[id]=mod;const relative=(name)=>{if(!name.startsWith('.'))return require(name);const parts=id.split('/');parts.pop();for(const bit of name.split('/')){if(bit==='..')parts.pop();else if(bit!=='.')parts.push(bit);}return internal(parts.join('/'));};factory(mod,mod.exports,relative);return mod.exports;}
+
+QRCode.PAD0 = 0xEC;
+QRCode.PAD1 = 0x11;
+
+QRCode.createData = function(typeNumber, errorCorrectLevel, dataList) {
+
+	var rsBlocks = QRRSBlock.getRSBlocks(typeNumber, errorCorrectLevel);
+
+	var buffer = new QRBitBuffer();
+
+	for (var i = 0; i < dataList.length; i++) {
+		var data = dataList[i];
+		buffer.put(data.mode, 4);
+		buffer.put(data.getLength(), QRUtil.getLengthInBits(data.mode, typeNumber) );
+		data.write(buffer);
+	}
+
+	// calc num max data.
+	var totalDataCount = 0;
+	for (var x = 0; x < rsBlocks.length; x++) {
+		totalDataCount += rsBlocks[x].dataCount;
+	}
+
+	if (buffer.getLengthInBits() > totalDataCount * 8) {
+		throw new Error("code length overflow. (" +
+            buffer.getLengthInBits() +
+            ">" +
+            totalDataCount * 8 +
+            ")");
+	}
+
+	// end code
+	if (buffer.getLengthInBits() + 4 <= totalDataCount * 8) {
+		buffer.put(0, 4);
+	}
+
+	// padding
+	while (buffer.getLengthInBits() % 8 !== 0) {
+		buffer.putBit(false);
+	}
+
+	// padding
+	while (true) {
+
+		if (buffer.getLengthInBits() >= totalDataCount * 8) {
+			break;
+		}
+		buffer.put(QRCode.PAD0, 8);
+
+		if (buffer.getLengthInBits() >= totalDataCount * 8) {
+			break;
+		}
+		buffer.put(QRCode.PAD1, 8);
+	}
+
+	return QRCode.createBytes(buffer, rsBlocks);
+};
+
+QRCode.createBytes = function(buffer, rsBlocks) {
+
+	var offset = 0;
+
+	var maxDcCount = 0;
+	var maxEcCount = 0;
+
+	var dcdata = new Array(rsBlocks.length);
+	var ecdata = new Array(rsBlocks.length);
+
+	for (var r = 0; r < rsBlocks.length; r++) {
+
+		var dcCount = rsBlocks[r].dataCount;
+		var ecCount = rsBlocks[r].totalCount - dcCount;
+
+		maxDcCount = Math.max(maxDcCount, dcCount);
+		maxEcCount = Math.max(maxEcCount, ecCount);
+
+		dcdata[r] = new Array(dcCount);
+
+		for (var i = 0; i < dcdata[r].length; i++) {
+			dcdata[r][i] = 0xff & buffer.buffer[i + offset];
+		}
+		offset += dcCount;
+
+		var rsPoly = QRUtil.getErrorCorrectPolynomial(ecCount);
+		var rawPoly = new QRPolynomial(dcdata[r], rsPoly.getLength() - 1);
+
+		var modPoly = rawPoly.mod(rsPoly);
+		ecdata[r] = new Array(rsPoly.getLength() - 1);
+		for (var x = 0; x < ecdata[r].length; x++) {
+            var modIndex = x + modPoly.getLength() - ecdata[r].length;
+			ecdata[r][x] = (modIndex >= 0)? modPoly.get(modIndex) : 0;
+		}
+
+	}
+
+	var totalCodeCount = 0;
+	for (var y = 0; y < rsBlocks.length; y++) {
+		totalCodeCount += rsBlocks[y].totalCount;
+	}
+
+	var data = new Array(totalCodeCount);
+	var index = 0;
+
+	for (var z = 0; z < maxDcCount; z++) {
+		for (var s = 0; s < rsBlocks.length; s++) {
+			if (z < dcdata[s].length) {
+				data[index++] = dcdata[s][z];
+			}
+		}
+	}
+
+	for (var xx = 0; xx < maxEcCount; xx++) {
+		for (var t = 0; t < rsBlocks.length; t++) {
+			if (xx < ecdata[t].length) {
+				data[index++] = ecdata[t][xx];
+			}
+		}
+	}
+
+	return data;
+
+};
+
+module.exports = QRCode;
+
+};
+function internal(id){
+  if(cache[id])return cache[id].exports;
+  const factory=modules[id];
+  if(!factory)return require(id);
+  const mod={exports:{}};
+  cache[id]=mod;
+  factory(mod,mod.exports,name=>{
+    if(!name.startsWith('.'))return require(name);
+    const parts=id.split('/');
+    parts.pop();
+    for(const bit of name.split('/')){
+      if(bit==='..')parts.pop();
+      else if(bit!=='.')parts.push(bit);
+    }
+    return internal(parts.join('/'));
+  });
+  return mod.exports;
+}
 module.exports=internal('main');
 })();

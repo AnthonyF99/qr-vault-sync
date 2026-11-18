@@ -17,3 +17,6 @@
 .qvs-conflict:last-child{border:0}
 .qvs-conflict small{color:var(--text-muted)}
 .qvs-errors{white-space:pre-wrap;max-height:300px;overflow:auto;font-size:var(--font-smaller)}
+.qvs-progress { width: 100%; }
+.qvs-note-versions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr)); gap: 1rem; }
+.qvs-note-versions pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 14rem; overflow: auto; }

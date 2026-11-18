@@ -1,9 +1,9 @@
 {
   "id": "qr-vault-sync",
   "name": "QR Vault Sync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minAppVersion": "1.4.0",
-  "description": "Encrypted local Wi-Fi sync via QR pairing, newest-file resolution, and optional backups.",
+  "description": "Encrypted vault sync with QR pairing over local Wi-Fi or Tailscale.",
   "author": "OpenAI",
   "isDesktopOnly": false
 }
